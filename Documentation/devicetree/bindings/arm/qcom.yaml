@@ -979,6 +979,7 @@ properties:
       - items:
           - enum:
               - xiaomi,jasmine
+              - xiaomi,jason
               - xiaomi,lavender
               - xiaomi,lavender-boe
               - xiaomi,lavender-shenchao
