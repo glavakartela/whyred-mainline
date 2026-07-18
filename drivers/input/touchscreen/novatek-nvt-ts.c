@@ -59,6 +59,13 @@ struct nvt_ts_data {
 	struct touchscreen_properties prop;
 	int max_touches;
 	u8 buf[NVT_TS_TOUCH_SIZE * NVT_TS_MAX_TOUCHES];
+	/*
+	 * Sometimes Novatek touchscreen is paired together with Novatek panel,
+	 * and they need to be powered together in sync.
+	 */
+	struct drm_panel_follower panel_follower;
+	bool is_panel_follower;
+	bool running;
 };
 
 static int nvt_ts_read_data(struct i2c_client *client, u8 reg, u8 *data, int count)
@@ -145,6 +152,9 @@ static int nvt_ts_start(struct input_dev *dev)
 	struct nvt_ts_data *data = input_get_drvdata(dev);
 	int error;
 
+	if (data->running)
+		return 0;
+
 	error = regulator_bulk_enable(ARRAY_SIZE(data->regulators), data->regulators);
 	if (error) {
 		dev_err(&data->client->dev, "failed to enable regulators\n");
@@ -154,6 +164,7 @@ static int nvt_ts_start(struct input_dev *dev)
 	enable_irq(data->client->irq);
 	gpiod_set_value_cansleep(data->reset_gpio, 0);
 
+	data->running = true;
 	return 0;
 }
 
@@ -161,9 +172,14 @@ static void nvt_ts_stop(struct input_dev *dev)
 {
 	struct nvt_ts_data *data = input_get_drvdata(dev);
 
+	if (!data->running)
+		return;
+
 	disable_irq(data->client->irq);
 	gpiod_set_value_cansleep(data->reset_gpio, 1);
 	regulator_bulk_disable(ARRAY_SIZE(data->regulators), data->regulators);
+
+	data->running = false;
 }
 
 static int nvt_ts_suspend(struct device *dev)
