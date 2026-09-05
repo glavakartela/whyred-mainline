@@ -203,6 +203,59 @@ static void rmi_i2c_unregister_transport(void *data)
 	rmi_unregister_transport_device(&rmi_i2c->xport);
 }
 
+#define RMI_I2C_PROBE_RETRIES		5
+#define RMI_I2C_PROBE_RETRY_DELAY_MS	100
+
+/*
+ * rmi_i2c_reset_toggle - pulse the reset GPIO once, honouring the DT-provided
+ * (or default) reset delay.
+ */
+static void rmi_i2c_reset_toggle(struct rmi_i2c_xport *rmi_i2c)
+{
+	if (!rmi_i2c->reset_gpio)
+		return;
+
+	gpiod_set_value_cansleep(rmi_i2c->reset_gpio, 1);
+	usleep_range(10000, 20000);
+	gpiod_set_value_cansleep(rmi_i2c->reset_gpio, 0);
+	msleep(rmi_i2c->reset_delay ?: DEFAULT_RESET_DELAY_MS);
+}
+
+/*
+ * rmi_i2c_probe_set_page - like rmi_set_page(), but retries with a fresh
+ * reset pulse on failure instead of giving up on the first ENXIO/EIO.
+ *
+ * Some whyred units come up flaky and don't answer i2c on the first
+ * page-select after power-on; a plain fixed startup delay isn't always
+ * enough. Toggling reset and trying again a few times fixes probe on
+ * those units without having to blindly stretch the boot-time delay for
+ * everyone.
+ */
+static int rmi_i2c_probe_set_page(struct rmi_i2c_xport *rmi_i2c)
+{
+	struct i2c_client *client = rmi_i2c->client;
+	int error;
+	int i;
+
+	for (i = 0; i < RMI_I2C_PROBE_RETRIES; i++) {
+		error = rmi_set_page(rmi_i2c, 0);
+		if (!error)
+			return 0;
+
+		dev_warn(&client->dev,
+			 "probe page-select attempt %d/%d failed (%d)%s\n",
+			 i + 1, RMI_I2C_PROBE_RETRIES, error,
+			 rmi_i2c->reset_gpio ? ", resetting" : "");
+
+		if (i + 1 < RMI_I2C_PROBE_RETRIES) {
+			rmi_i2c_reset_toggle(rmi_i2c);
+			msleep(RMI_I2C_PROBE_RETRY_DELAY_MS);
+		}
+	}
+
+	return error;
+}
+
 static int rmi_i2c_probe(struct i2c_client *client)
 {
 	struct rmi_device_platform_data *pdata;
@@ -265,17 +318,13 @@ static int rmi_i2c_probe(struct i2c_client *client)
 
 	msleep(rmi_i2c->startup_delay);
 
-	if (rmi_i2c->reset_gpio) {
-		of_property_read_u32(client->dev.of_node, "syna,reset-delay-ms",
-				     &rmi_i2c->reset_delay);
-		gpiod_set_value_cansleep(rmi_i2c->reset_gpio, 1);
-		usleep_range(10000, 20000);
-		gpiod_set_value_cansleep(rmi_i2c->reset_gpio, 0);
-		msleep(rmi_i2c->reset_delay ?: DEFAULT_RESET_DELAY_MS);
-	}
+	of_property_read_u32(client->dev.of_node, "syna,reset-delay-ms",
+			     &rmi_i2c->reset_delay);
 
 	rmi_i2c->client = client;
 	mutex_init(&rmi_i2c->page_mutex);
+
+	rmi_i2c_reset_toggle(rmi_i2c);
 
 	rmi_i2c->xport.dev = &client->dev;
 	rmi_i2c->xport.proto_name = "i2c";
@@ -286,10 +335,14 @@ static int rmi_i2c_probe(struct i2c_client *client)
 	/*
 	 * Setting the page to zero will (a) make sure the PSR is in a
 	 * known state, and (b) make sure we can talk to the device.
+	 * Retry with a reset pulse in between attempts, since some units
+	 * don't come up reliably on the first try after power-on.
 	 */
-	error = rmi_set_page(rmi_i2c, 0);
+	error = rmi_i2c_probe_set_page(rmi_i2c);
 	if (error) {
-		dev_err(&client->dev, "Failed to set page select to 0\n");
+		dev_err(&client->dev,
+			"Failed to set page select to 0 after %d attempts\n",
+			RMI_I2C_PROBE_RETRIES);
 		return error;
 	}
 
@@ -318,19 +371,31 @@ static int rmi_i2c_suspend(struct device *dev)
 
 	ret = rmi_driver_suspend(rmi_i2c->xport.rmi_dev, true);
 	if (ret)
-		dev_warn(dev, "Failed to resume device: %d\n", ret);
+		dev_warn(dev, "Failed to write sleep mode, suspending anyway: %d\n",
+			 ret);
 
 	regulator_bulk_disable(ARRAY_SIZE(rmi_i2c->supplies),
 			       rmi_i2c->supplies);
 
-	return ret;
+	/*
+	 * We're cutting power right after this regardless, so a failed
+	 * best-effort sleep-mode write shouldn't abort system suspend for
+	 * the whole device. Returning an error here made PM core treat
+	 * this device's suspend as failed and unwind the entire suspend
+	 * cycle, which just spun in a retry loop without ever sleeping.
+	 */
+	return 0;
 }
+
+#define RMI_I2C_RESUME_RETRIES		5
+#define RMI_I2C_RESUME_RETRY_DELAY_MS	100
 
 static int rmi_i2c_resume(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct rmi_i2c_xport *rmi_i2c = i2c_get_clientdata(client);
 	int ret;
+	int i;
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(rmi_i2c->supplies),
 				    rmi_i2c->supplies);
@@ -339,11 +404,27 @@ static int rmi_i2c_resume(struct device *dev)
 
 	msleep(rmi_i2c->startup_delay);
 
-	ret = rmi_driver_resume(rmi_i2c->xport.rmi_dev, true);
-	if (ret)
-		dev_warn(dev, "Failed to resume device: %d\n", ret);
+	for (i = 0; i < RMI_I2C_RESUME_RETRIES; i++) {
+		ret = rmi_driver_resume(rmi_i2c->xport.rmi_dev, true);
+		if (!ret)
+			return 0;
 
-	return ret;
+		dev_warn(dev, "resume attempt %d/%d failed: %d%s\n",
+			 i + 1, RMI_I2C_RESUME_RETRIES, ret,
+			 i + 1 < RMI_I2C_RESUME_RETRIES ? ", retrying" : "");
+
+		if (i + 1 < RMI_I2C_RESUME_RETRIES)
+			msleep(RMI_I2C_RESUME_RETRY_DELAY_MS);
+	}
+
+	/*
+	 * Best-effort, same reasoning as rmi_i2c_suspend(): don't fail
+	 * system resume over a still-unresponsive touch controller after
+	 * RMI_I2C_RESUME_RETRIES tries. There's no useful recovery the PM
+	 * core can do about it, and returning an error here just gets the
+	 * failure logged a second time.
+	 */
+	return 0;
 }
 
 static int rmi_i2c_runtime_suspend(struct device *dev)
@@ -388,7 +469,7 @@ static const struct dev_pm_ops rmi_i2c_pm = {
 };
 
 static const struct i2c_device_id rmi_id[] = {
-	{ .name = "rmi4_i2c" },
+	{ "rmi4_i2c" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rmi_id);

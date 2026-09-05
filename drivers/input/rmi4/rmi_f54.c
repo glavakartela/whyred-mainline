@@ -104,9 +104,7 @@ struct f54_data {
 
 	enum rmi_f54_report_type report_type;
 	u8 *report_data;
-	size_t max_report_size;
 	int report_size;
-	int report_error;
 
 	bool is_busy;
 	struct mutex status_mutex;
@@ -341,12 +339,6 @@ static void rmi_f54_buffer_queue(struct vb2_buffer *vb)
 		mutex_lock(&f54->data_mutex);
 	}
 
-	if (f54->report_error) {
-		dev_err(&f54->fn->dev, "Error acquiring report: %d\n", f54->report_error);
-		state = VB2_BUF_STATE_ERROR;
-		goto data_done;
-	}
-
 	ptr = vb2_plane_vaddr(vb, 0);
 	if (!ptr) {
 		dev_err(&f54->fn->dev, "Error acquiring frame ptr\n");
@@ -452,12 +444,7 @@ static int rmi_f54_set_input(struct f54_data *f54, unsigned int i)
 
 static int rmi_f54_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 {
-	struct f54_data *f54 = video_drvdata(file);
-
-	if (vb2_is_busy(&f54->queue))
-		return -EBUSY;
-
-	return rmi_f54_set_input(f54, i);
+	return rmi_f54_set_input(video_drvdata(file), i);
 }
 
 static int rmi_f54_vidioc_g_input(struct file *file, void *priv,
@@ -558,14 +545,7 @@ static void rmi_f54_work(struct work_struct *work)
 		dev_err(&fn->dev, "Bad report size, report type=%d\n",
 				f54->report_type);
 		error = -EINVAL;
-		goto out;     /* retry won't help */
-	}
-
-	if (report_size > f54->max_report_size) {
-		dev_err(&fn->dev, "Report size %d exceeds buffer size %zu\n",
-			report_size, f54->max_report_size);
-		error = -EINVAL;
-		goto out;
+		goto error;     /* retry won't help */
 	}
 
 	/*
@@ -576,7 +556,7 @@ static void rmi_f54_work(struct work_struct *work)
 			 &command);
 	if (error) {
 		dev_err(&fn->dev, "Failed to read back command\n");
-		goto out;
+		goto error;
 	}
 	if (command & F54_GET_REPORT) {
 		if (time_after(jiffies, f54->timeout)) {
@@ -584,7 +564,7 @@ static void rmi_f54_work(struct work_struct *work)
 			error = -ETIMEDOUT;
 		}
 		report_size = 0;
-		goto out;
+		goto error;
 	}
 
 	rmi_dbg(RMI_DEBUG_FN, &fn->dev, "Get report command completed, reading data\n");
@@ -599,7 +579,7 @@ static void rmi_f54_work(struct work_struct *work)
 					fifo, sizeof(fifo));
 		if (error) {
 			dev_err(&fn->dev, "Failed to set fifo start offset\n");
-			goto out;
+			goto abort;
 		}
 
 		error = rmi_read_block(fn->rmi_dev, fn->fd.data_base_addr +
@@ -608,16 +588,15 @@ static void rmi_f54_work(struct work_struct *work)
 		if (error) {
 			dev_err(&fn->dev, "%s: read [%d bytes] returned %d\n",
 				__func__, size, error);
-			goto out;
+			goto abort;
 		}
 	}
 
-out:
+abort:
+	f54->report_size = error ? 0 : report_size;
+error:
 	if (error)
 		report_size = 0;
-
-	f54->report_size = report_size;
-	f54->report_error = error;
 
 	if (report_size == 0 && !error) {
 		queue_delayed_work(f54->workqueue, &f54->work,
@@ -699,8 +678,8 @@ static int rmi_f54_probe(struct rmi_function *fn)
 
 	rx = f54->num_rx_electrodes;
 	tx = f54->num_tx_electrodes;
-	f54->max_report_size = array3_size(tx, rx, sizeof(u16));
-	f54->report_data = devm_kzalloc(&fn->dev, f54->max_report_size,
+	f54->report_data = devm_kzalloc(&fn->dev,
+					array3_size(tx, rx, sizeof(u16)),
 					GFP_KERNEL);
 	if (f54->report_data == NULL)
 		return -ENOMEM;
