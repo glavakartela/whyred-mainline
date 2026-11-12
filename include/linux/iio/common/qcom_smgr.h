@@ -3,9 +3,12 @@
 #ifndef __QCOM_SMGR_H__
 #define __QCOM_SMGR_H__
 
+#include <linux/completion.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/types.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 enum qcom_smgr_sensor_type {
 	SNS_SMGR_SENSOR_TYPE_UNKNOWN,
@@ -39,18 +42,31 @@ struct qcom_smgr_data_type_item {
 	u16 cur_sample_rate;
 };
 
+struct qcom_smgr;
+struct qcom_smgr_sensor;
+
+struct qcom_smgr_direct {
+	struct qcom_smgr *smgr;
+	struct qcom_smgr_sensor *sensor;
+	u8 data_type;
+
+	/* Serializes starting and stopping the one-shot report. */
+	struct mutex lock;
+	struct completion done;
+	struct delayed_work stop;
+	bool active;
+	u32 values[3];
+};
+
 struct qcom_smgr_sensor {
 	u8 id;
 	enum qcom_smgr_sensor_type type;
 
 	u8 data_type_count;
-	/*
-	 * Only SNS_SMGR_DATA_TYPE_PRIMARY is used at the moment, but we store
-	 * SNS_SMGR_DATA_TYPE_SECONDARY when available as well for future use.
-	 */
 	struct qcom_smgr_data_type_item *data_types;
 
 	struct iio_dev *iio_dev;
+	struct qcom_smgr_direct direct[SNS_SMGR_DATA_TYPE_COUNT];
 };
 
 struct qcom_smgr_iio_priv {
