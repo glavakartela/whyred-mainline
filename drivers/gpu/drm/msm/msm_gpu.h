@@ -212,6 +212,13 @@ struct msm_gpu {
 	/* does gpu need hw_init? */
 	bool needs_hw_init;
 
+	/*
+	 * Some GPUs (A5xx) can execute one non-preemptable draw for a long
+	 * time while making real progress. Allow a bounded progress window
+	 * instead of resetting after a fixed number of samples.
+	 */
+	bool allow_long_progress;
+
 	/**
 	 * global_faults: number of GPU hangs not attributed to a particular
 	 * address space
