@@ -94,6 +94,12 @@ struct msm_ringbuffer {
 	int hangcheck_progress_retries;
 
 	/**
+	 * hangcheck_progress_start: jiffies when the current progress window
+	 * started. Zero when no progress window is active.
+	 */
+	unsigned long hangcheck_progress_start;
+
+	/**
 	 * last_cp_state: The state of the CP at the last call to gpu->progress()
 	 */
 	struct msm_cp_state last_cp_state;

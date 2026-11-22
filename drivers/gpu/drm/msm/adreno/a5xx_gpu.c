@@ -8,10 +8,15 @@
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/pm_opp.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include "msm_gem.h"
 #include "msm_mmu.h"
 #include "a5xx_gpu.h"
+
+static bool progress_debug;
+module_param(progress_debug, bool, 0644);
+MODULE_PARM_DESC(progress_debug, "Log every A5xx hangcheck progress sample");
 
 extern bool hang_debug;
 static void a5xx_dump(struct msm_gpu *gpu);
@@ -1771,11 +1776,25 @@ static bool a5xx_progress(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 		.ib2_rem  = gpu_read(gpu, REG_A5XX_CP_IB2_BUFSZ),
 	};
 	u64 alu_cycles = gpu_read64(gpu, REG_A5XX_RBBM_PERFCTR_SP_0_LO);
+	u64 prev_alu = a5xx_gpu->last_alu_cycles;
 	bool progress;
 
 	/* The CP can stall on one packet while shaders keep running */
 	progress = !!memcmp(&cp_state, &ring->last_cp_state, sizeof(cp_state)) ||
-		   alu_cycles != a5xx_gpu->last_alu_cycles;
+		   alu_cycles != prev_alu;
+
+	if (progress_debug)
+		dev_info(gpu->dev->dev,
+			 "%s: progress rb%d fence=%u/%u retries=%d window=%u ms "
+			 "cp=%016llx/%08x %016llx/%08x alu=%016llx delta=%016llx progress=%u\n",
+			 gpu->name, ring->id, ring->memptrs->fence,
+			 ring->fctx->last_fence, ring->hangcheck_progress_retries,
+			 ring->hangcheck_progress_start ?
+			 jiffies_to_msecs(jiffies - ring->hangcheck_progress_start) : 0,
+			 (unsigned long long)cp_state.ib1_base, cp_state.ib1_rem,
+			 (unsigned long long)cp_state.ib2_base, cp_state.ib2_rem,
+			 (unsigned long long)alu_cycles,
+			 (unsigned long long)(alu_cycles - prev_alu), progress);
 
 	ring->last_cp_state = cp_state;
 	a5xx_gpu->last_alu_cycles = alu_cycles;
@@ -1918,6 +1937,8 @@ static struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
 		a5xx_destroy(&(a5xx_gpu->base.base));
 		return ERR_PTR(ret);
 	}
+
+	gpu->allow_long_progress = true;
 
 	/* Set the speedbin value that is passed to userspace */
 	if (adreno_read_speedbin(&pdev->dev, &speedbin) || !speedbin)

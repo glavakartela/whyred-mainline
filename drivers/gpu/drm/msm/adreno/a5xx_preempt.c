@@ -2,8 +2,20 @@
 /* Copyright (c) 2017 The Linux Foundation. All rights reserved.
  */
 
+#include <linux/moduleparam.h>
+
 #include "msm_gem.h"
 #include "a5xx_gpu.h"
+
+/*
+ * Diagnostic/test knob: if the context switch has not completed but the
+ * GPU is still retiring ALU work, wait a bounded amount of extra time
+ * instead of resetting it immediately.
+ */
+static unsigned int preempt_progress_max_ms = 30000;
+module_param(preempt_progress_max_ms, uint, 0644);
+MODULE_PARM_DESC(preempt_progress_max_ms,
+	"A5xx: maximum ALU-progress extension of the preemption watchdog in ms");
 
 /*
  * Try to transition the preemption state from old to new. Return
@@ -82,11 +94,82 @@ static void a5xx_preempt_timer(struct timer_list *t)
 						       preempt_timer);
 	struct msm_gpu *gpu = &a5xx_gpu->base.base;
 	struct drm_device *dev = gpu->dev;
+	struct msm_ringbuffer *cur, *next;
+	struct a5xx_preempt_record *record;
+	struct msm_cp_state cp_state = {
+		.ib1_base = gpu_read64(gpu, REG_A5XX_CP_IB1_BASE),
+		.ib2_base = gpu_read64(gpu, REG_A5XX_CP_IB2_BASE),
+		.ib1_rem  = gpu_read(gpu, REG_A5XX_CP_IB1_BUFSZ),
+		.ib2_rem  = gpu_read(gpu, REG_A5XX_CP_IB2_BUFSZ),
+	};
+	u64 alu_cycles, baseline_alu_cycles;
+	unsigned long progress_ms = 0;
+	u32 int_status, int_mask;
+
+	if (atomic_read(&a5xx_gpu->preempt_state) != PREEMPT_TRIGGERED)
+		return;
+
+	alu_cycles = gpu_read64(gpu, REG_A5XX_RBBM_PERFCTR_SP_0_LO);
+	baseline_alu_cycles = READ_ONCE(a5xx_gpu->preempt_alu_cycles);
+
+	if (preempt_progress_max_ms &&
+	    alu_cycles != baseline_alu_cycles) {
+		if (!a5xx_gpu->preempt_progress_start)
+			a5xx_gpu->preempt_progress_start = jiffies;
+
+		progress_ms = jiffies_to_msecs(jiffies -
+				a5xx_gpu->preempt_progress_start);
+
+		if (progress_ms < preempt_progress_max_ms) {
+			WRITE_ONCE(a5xx_gpu->preempt_alu_cycles, alu_cycles);
+			DRM_DEV_INFO(dev->dev,
+				"%s: preemption pending, ALU progressing for %lu ms: extend\n",
+				gpu->name, progress_ms);
+			mod_timer(&a5xx_gpu->preempt_timer,
+				  jiffies + msecs_to_jiffies(10000));
+			return;
+		}
+	}
 
 	if (!try_preempt_state(a5xx_gpu, PREEMPT_TRIGGERED, PREEMPT_FAULTED))
 		return;
 
-	DRM_DEV_ERROR(dev->dev, "%s: preemption timed out\n", gpu->name);
+	cur = a5xx_gpu->cur_ring;
+	next = a5xx_gpu->next_ring;
+	record = next ? a5xx_gpu->preempt[next->id] : NULL;
+	/* Preserve the state that explains why the context switch timed out. */
+	int_status = gpu_read(gpu, REG_A5XX_RBBM_INT_0_STATUS);
+	int_mask = gpu_read(gpu, REG_A5XX_RBBM_INT_0_MASK);
+	DRM_DEV_ERROR(dev->dev,
+		"%s: preemption timed out: cur=%d next=%d switch=%08x "
+		"rbbm=%08x/%08x int=%08x/%08x alu=%016llx baseline=%016llx "
+		"alu_changed=%u cp_changed=%u progress_ms=%lu\n",
+		gpu->name, cur ? cur->id : -1, next ? next->id : -1,
+		gpu_read(gpu, REG_A5XX_CP_CONTEXT_SWITCH_CNTL),
+		gpu_read(gpu, REG_A5XX_RBBM_STATUS),
+		gpu_read(gpu, REG_A5XX_RBBM_STATUS3), int_status, int_mask,
+		(unsigned long long)alu_cycles,
+		(unsigned long long)baseline_alu_cycles,
+		alu_cycles != baseline_alu_cycles,
+		memcmp(&cp_state, &a5xx_gpu->preempt_cp_state,
+		       sizeof(cp_state)) != 0,
+		progress_ms);
+	DRM_DEV_ERROR(dev->dev,
+		"%s: preemption rings: cur_fence=%u/%u rptr/wptr=%u/%u "
+		"ib1=%016llx/%08x ib2=%016llx/%08x\n",
+		gpu->name, cur ? cur->memptrs->fence : 0,
+		cur ? cur->fctx->last_fence : 0,
+		cur ? gpu->funcs->get_rptr(gpu, cur) : 0,
+		cur ? get_wptr(cur) : 0,
+		(unsigned long long)cp_state.ib1_base, cp_state.ib1_rem,
+		(unsigned long long)cp_state.ib2_base, cp_state.ib2_rem);
+	if (record)
+		DRM_DEV_ERROR(dev->dev,
+			"%s: preemption record: magic=%08x info=%08x "
+			"data=%08x rptr/wptr=%u/%u\n",
+			gpu->name, record->magic, record->info, record->data,
+			record->rptr, record->wptr);
+
 	kthread_queue_work(gpu->worker, &gpu->recover_work);
 }
 
@@ -153,6 +236,15 @@ void a5xx_preempt_trigger(struct msm_gpu *gpu)
 		a5xx_gpu->preempt_iova[ring->id]);
 
 	a5xx_gpu->next_ring = ring;
+	a5xx_gpu->preempt_progress_start = jiffies;
+	WRITE_ONCE(a5xx_gpu->preempt_alu_cycles,
+		gpu_read64(gpu, REG_A5XX_RBBM_PERFCTR_SP_0_LO));
+	a5xx_gpu->preempt_cp_state = (struct msm_cp_state) {
+		.ib1_base = gpu_read64(gpu, REG_A5XX_CP_IB1_BASE),
+		.ib2_base = gpu_read64(gpu, REG_A5XX_CP_IB2_BASE),
+		.ib1_rem  = gpu_read(gpu, REG_A5XX_CP_IB1_BUFSZ),
+		.ib2_rem  = gpu_read(gpu, REG_A5XX_CP_IB2_BUFSZ),
+	};
 
 	/* Start a timer to catch a stuck preemption */
 	mod_timer(&a5xx_gpu->preempt_timer, jiffies + msecs_to_jiffies(10000));
@@ -183,6 +275,7 @@ void a5xx_preempt_irq(struct msm_gpu *gpu)
 
 	/* Delete the preemption watchdog timer */
 	timer_delete(&a5xx_gpu->preempt_timer);
+	a5xx_gpu->preempt_progress_start = 0;
 
 	/*
 	 * The hardware should be setting CP_CONTEXT_SWITCH_CNTL to zero before
