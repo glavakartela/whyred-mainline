@@ -15,9 +15,19 @@
 
 #include <linux/string_helpers.h>
 #include <linux/devcoredump.h>
+#include <linux/moduleparam.h>
 #include <linux/sched/task.h>
 #include <linux/sched/mm.h>
 #include <linux/utsname.h>
+
+/*
+ * Diagnostic/test knob: how long A5xx may keep making ALU/CP progress
+ * before hangcheck gives up. Zero keeps the upstream fixed retry limit.
+ */
+static unsigned int hangcheck_progress_max_ms = 30000;
+module_param(hangcheck_progress_max_ms, uint, 0644);
+MODULE_PARM_DESC(hangcheck_progress_max_ms,
+	"A5xx: maximum continuous progress window in ms (0 = upstream behavior)");
 
 /*
  * Power Management:
@@ -634,11 +644,25 @@ static void hangcheck_timer_reset(struct msm_gpu *gpu)
 
 static bool made_progress(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 {
-	if (ring->hangcheck_progress_retries >= DRM_MSM_HANGCHECK_PROGRESS_RETRIES)
-		return false;
-
 	if (!gpu->funcs->progress)
 		return false;
+
+	if (gpu->allow_long_progress && hangcheck_progress_max_ms) {
+		if (!ring->hangcheck_progress_start)
+			ring->hangcheck_progress_start = jiffies;
+
+		if (time_after(jiffies, ring->hangcheck_progress_start +
+			       msecs_to_jiffies(hangcheck_progress_max_ms))) {
+			DRM_DEV_ERROR(gpu->dev->dev,
+				"%s: progress window expired after %u ms (retries=%d)\n",
+				gpu->name, hangcheck_progress_max_ms,
+				ring->hangcheck_progress_retries);
+			return false;
+		}
+	} else if (ring->hangcheck_progress_retries >=
+		   DRM_MSM_HANGCHECK_PROGRESS_RETRIES) {
+		return false;
+	}
 
 	if (!gpu->funcs->progress(gpu, ring))
 		return false;
@@ -658,6 +682,7 @@ static void hangcheck_handler(struct timer_list *t)
 		/* some progress has been made.. ya! */
 		ring->hangcheck_fence = fence;
 		ring->hangcheck_progress_retries = 0;
+		ring->hangcheck_progress_start = 0;
 	} else if (fence_before(fence, ring->fctx->last_fence) &&
 			!made_progress(gpu, ring)) {
 		/* no progress and not done.. hung! */
