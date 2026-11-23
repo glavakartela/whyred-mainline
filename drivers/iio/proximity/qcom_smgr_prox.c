@@ -15,6 +15,7 @@
 static const struct iio_chan_spec qcom_smgr_prox_iio_channels[] = {
 	{
 		.type = IIO_PROXIMITY,
+		.address = 0,
 		.scan_index = 0,
 		.scan_type = {
 			.sign = 'u',
@@ -24,6 +25,20 @@ static const struct iio_chan_spec qcom_smgr_prox_iio_channels[] = {
 		},
 		.info_mask_separate = BIT(IIO_CHAN_INFO_OFFSET) |
 				      BIT(IIO_CHAN_INFO_SCALE) |
+				      BIT(IIO_CHAN_INFO_SAMP_FREQ)
+	},
+	{
+		.type = IIO_LIGHT,
+		.channel = 1,
+		.address = 1,
+		.scan_index = 1,
+		.scan_type = {
+			.sign = 'u',
+			.realbits = 32,
+			.storagebits = 32,
+			.endianness = IIO_LE,
+		},
+		.info_mask_separate = BIT(IIO_CHAN_INFO_SCALE) |
 				      BIT(IIO_CHAN_INFO_SAMP_FREQ)
 	},
 	{
