@@ -640,17 +640,11 @@ static void ipa_cmd_ip_tag_status_add(struct ipa_trans *trans)
 	struct ipa_cmd_ip_packet_tag_status *payload;
 	union ipa_cmd_payload *cmd_payload;
 	dma_addr_t payload_addr;
-	u64 tag_mask;
-
-	if (trans->dma_subsys->version <= IPA_VERSION_2_6L)
-		tag_mask = IPA_V2_IP_PACKET_TAG_STATUS_TAG_FMASK;
-	else
-		tag_mask = IPA_V3_IP_PACKET_TAG_STATUS_TAG_FMASK;
 
 	cmd_payload = ipa_cmd_payload_alloc(ipa, &payload_addr);
 	payload = &cmd_payload->ip_packet_tag_status;
 
-	payload->tag = le64_encode_bits(0, tag_mask);
+	payload->tag = 0;
 
 	ipa_trans_cmd_add(trans, payload, sizeof(*payload), payload_addr,
 			  opcode);
