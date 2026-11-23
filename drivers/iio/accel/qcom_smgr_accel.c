@@ -11,6 +11,7 @@
 #include <linux/iio/common/qcom_smgr.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/kfifo_buf.h>
+#include <linux/iio/trigger.h>
 
 static const struct iio_chan_spec qcom_smgr_accel_iio_channels[] = {
 	{
@@ -71,9 +72,19 @@ static const struct iio_chan_spec qcom_smgr_accel_iio_channels[] = {
 	},
 };
 
+static int qcom_smgr_accel_trigger_set_state(struct iio_trigger *trig, bool state)
+{
+	return 0;
+}
+
+static const struct iio_trigger_ops qcom_smgr_accel_trigger_ops = {
+	.set_trigger_state = qcom_smgr_accel_trigger_set_state,
+};
+
 static int qcom_smgr_accel_probe(struct platform_device *pdev)
 {
 	struct iio_dev *iio_dev;
+	struct iio_trigger *trig;
 	struct qcom_smgr_iio_priv *priv;
 	int ret;
 
@@ -87,6 +98,7 @@ static int qcom_smgr_accel_probe(struct platform_device *pdev)
 
 	iio_dev->name = "qcom-smgr-accel";
 	iio_dev->info = &qcom_smgr_iio_info;
+	iio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_TRIGGERED;
 	iio_dev->channels = qcom_smgr_accel_iio_channels;
 	iio_dev->num_channels = ARRAY_SIZE(qcom_smgr_accel_iio_channels);
 
@@ -97,6 +109,21 @@ static int qcom_smgr_accel_probe(struct platform_device *pdev)
 			ERR_PTR(ret));
 		return ret;
 	}
+
+	trig = devm_iio_trigger_alloc(&pdev->dev, "%s", iio_dev->name);
+	if (!trig)
+		return -ENOMEM;
+
+	iio_trigger_set_drvdata(trig, iio_dev);
+
+	ret = devm_iio_trigger_register(&pdev->dev, trig);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to register IIO trigger: %pe\n",
+			ERR_PTR(ret));
+		return ret;
+	}
+
+	iio_dev->trig = iio_trigger_get(trig);
 
 	ret = devm_iio_device_register(&pdev->dev, iio_dev);
 	if (ret) {
