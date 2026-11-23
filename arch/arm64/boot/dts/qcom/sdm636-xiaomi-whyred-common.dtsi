@@ -391,8 +391,14 @@
 	status = "okay";
 };
 
+&adsp_pil {
+	firmware-name = "qcom/adsp.mbn";
+
+	status = "okay";
+};
+
 &remoteproc_mss {
-	firmware-name = "mba.mbn", "modem.mdt";
+	firmware-name = "qcom/mba.mbn", "qcom/modem.mbn";
 
 	status = "okay";
 };
@@ -778,7 +784,7 @@
 };
 
 &venus {
-	firmware-name = "qcom/venus-4.4/venus.mdt";
+	firmware-name = "qcom/venus-4.4/venus.mbn";
 
 	status = "okay";
 };
