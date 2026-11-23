@@ -37,7 +37,7 @@ struct sns_reg_group_req {
 struct sns_reg_group_resp {
 	unsigned short result;
 	unsigned short id;
-	unsigned short data_len;
+	unsigned int data_len;
 	unsigned char data[SNS_REG_GROUP_DATA_MAX_LEN];
 };
 
@@ -75,7 +75,7 @@ struct qmi_elem_info sns_reg_group_resp_ei[] = {
 	{
 		.data_type  = QMI_DATA_LEN,
 		.elem_len   = 1,
-		.elem_size  = sizeof(unsigned short),
+		.elem_size  = sizeof(unsigned int),
 		.array_type = NO_ARRAY,
 		.tlv_type   = 0x04,
 		.offset     = offsetof(struct sns_reg_group_resp, data_len),
