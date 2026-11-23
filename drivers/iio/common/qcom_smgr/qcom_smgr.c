@@ -220,7 +220,7 @@ static int qcom_smgr_request_buffering(struct qcom_smgr *smgr,
 	struct sns_smgr_buffering_resp resp = {};
 	struct qmi_txn txn;
 	u16 sample_rate = 0;
-	int ret;
+	int ret, i;
 
 	if (enable) {
 		req.action = SNS_SMGR_BUFFERING_ACTION_ADD;
@@ -253,11 +253,20 @@ static int qcom_smgr_request_buffering(struct qcom_smgr *smgr,
 
 		req.report_rate = sample_rate * SMGR_REPORT_RATE_HZ;
 
-		req.item_len = 1;
-		req.items[0].sensor_id = sensor->id;
-		req.items[0].data_type = SNS_SMGR_DATA_TYPE_PRIMARY;
+		req.item_len = sensor->data_type_count;
+		for (i = 0; i < sensor->data_type_count; i++) {
+			req.items[i].sensor_id = sensor->id;
+			req.items[i].data_type = i;
+			req.items[i].sampling_rate = sample_rate;
 
-		req.items[0].sampling_rate = sample_rate;
+			/*
+			 * Unknown fields set to values frequently seen in dumps and
+			 * known to be working (although many different random values
+			 * appear to not cause any trouble).
+			 */
+			req.items[i].val1 = 3;
+			req.items[i].val2 = 1;
+		}
 
 		/*
 		 * Unknown fields set to values frequently seen in dumps and
@@ -382,7 +391,7 @@ static int qcom_smgr_iio_read_raw(struct iio_dev *iio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		*val = priv->sensor->data_types[0].cur_sample_rate;
+		*val = priv->sensor->data_types[chan->address].cur_sample_rate;
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
 		switch (chan->type) {
@@ -400,7 +409,7 @@ static int qcom_smgr_iio_read_raw(struct iio_dev *iio_dev,
 			 * numerator and denominator, and move the -1 coefficient to the
 			 * denominator. This way we can exactly fit within the lower bound of int.
 			 */
-			*val = priv->sensor->data_types[0].range / 2;
+			*val = priv->sensor->data_types[chan->address].range / 2;
 			*val2 = -SMGR_VALUE_DIV / 2 * SMGR_VALUE_DIV;
 			return IIO_VAL_FRACTIONAL;
 		default:
@@ -417,7 +426,7 @@ static int qcom_smgr_iio_read_raw(struct iio_dev *iio_dev,
 		 * Proximity values are inverted and start from the upper bound as explained above.
 		 * No other channel types have an offset.
 		 */
-		*val = priv->sensor->data_types[0].range;
+		*val = priv->sensor->data_types[chan->address].range;
 		*val2 = SMGR_VALUE_DIV;
 		return IIO_VAL_FRACTIONAL;
 	}
@@ -433,7 +442,7 @@ static int qcom_smgr_iio_write_raw(struct iio_dev *iio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		priv->sensor->data_types[0].cur_sample_rate = val;
+		priv->sensor->data_types[chan->address].cur_sample_rate = val;
 
 		/*
 		 * Send new SMGR buffering request with updated rates
@@ -455,7 +464,7 @@ static int qcom_smgr_iio_read_avail(struct iio_dev *iio_dev,
 {
 	struct qcom_smgr_iio_priv *priv = iio_priv(iio_dev);
 	const int samp_freq_vals[3] = {
-		1, 1, priv->sensor->data_types[0].cur_sample_rate
+		1, 1, priv->sensor->data_types[chan->address].cur_sample_rate
 	};
 
 	switch (mask) {
