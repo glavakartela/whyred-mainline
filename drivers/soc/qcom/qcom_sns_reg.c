@@ -27,7 +27,8 @@
 #define SNS_REG_GROUP_DATA_MAX_LEN	0x100
 
 /* Maximum size of group response packet = size of all TLVs + size of data */
-#define SNS_REG_GROUP_RESP_MAX_LEN	5 + 5 + 5 + SNS_REG_GROUP_DATA_MAX_LEN /* 271 */
+#define SNS_REG_GROUP_RESP_MAX_LEN \
+	(5 + 5 + 5 + 3 + SNS_REG_GROUP_DATA_MAX_LEN) /* 274 */
 
 struct sns_reg_group_req {
 	unsigned short id;
