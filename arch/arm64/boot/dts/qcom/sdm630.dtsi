@@ -2484,10 +2484,9 @@
 			      <0x147c5000 0x2000>;	/* "ipa-shared": IPA SRAM */
 			reg-names = "ipa-reg", "ipa-shared";
 
-			/* IPA interrupt only; no "gsi" and no SMP2P interrupts on v2.x */
-			interrupts = <GIC_SPI 333 IRQ_TYPE_EDGE_RISING>,
-				     <GIC_SPI 432 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "ipa", "dma";
+			/* IPA interrupt only; BAM has its own interrupt. */
+			interrupts = <GIC_SPI 333 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "ipa";
 
 			clocks = <&rpmcc RPM_SMD_IPA_CLK>;
 			clock-names = "core";
@@ -2514,7 +2513,7 @@
 			/* Keep if IPA sits behind the SMMU (SDM630 does). */
 			iommus = <&anoc2_smmu 0x19c0>, <&anoc2_smmu 0x19c2>;
 
-			status = "okay";
+			status = "disabled";
 		};
 
 		ipa_bam: dma-controller@14784000 {
@@ -2525,6 +2524,8 @@
 			clock-names = "bam_clk";
 			#dma-cells = <1>;
 			qcom,ee = <0>;
+
+			status = "disabled";
 		};
 
 		lpi_tlmm: pinctrl@15070000 {

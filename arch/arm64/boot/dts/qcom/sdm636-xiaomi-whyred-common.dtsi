@@ -1001,3 +1001,11 @@
 		};
 	};
 };
+
+&ipa {
+	status = "okay";
+};
+
+&ipa_bam {
+	status = "okay";
+};
