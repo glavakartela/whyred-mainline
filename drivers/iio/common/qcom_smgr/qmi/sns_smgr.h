@@ -118,6 +118,13 @@ struct sns_smgr_buffering_req {
 	u8 action;
 	u32 report_rate;
 	u8 item_len;
+	/*
+	 * qmi_encdec reads a QMI_DATA_LEN element as a u32 from the C
+	 * structure even when it is encoded as a single byte on the wire.
+	 * Keep these bytes zero so that read does not pick up the first
+	 * item's sensor_id and data_type.
+	 */
+	u8 reserved[3];
 	struct sns_smgr_buffering_req_item items[SNS_SMGR_DATA_TYPE_COUNT];
 	u8 notify_suspend_valid;
 	struct sns_smgr_buffering_req_notify_suspend notify_suspend;
