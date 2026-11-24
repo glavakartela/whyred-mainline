@@ -12,6 +12,8 @@
 #include <linux/iio/iio.h>
 #include <linux/iio/kfifo_buf.h>
 #include <linux/iio/trigger.h>
+#include <linux/iio/trigger_consumer.h>
+#include <linux/iio/triggered_buffer.h>
 
 static const struct iio_chan_spec qcom_smgr_accel_iio_channels[] = {
 	{
@@ -72,13 +74,24 @@ static const struct iio_chan_spec qcom_smgr_accel_iio_channels[] = {
 	},
 };
 
-static int qcom_smgr_accel_trigger_set_state(struct iio_trigger *trig, bool state)
+static irqreturn_t qcom_smgr_accel_trigger_handler(int irq, void *p)
+{
+	struct iio_poll_func *pf = p;
+
+	iio_trigger_notify_done(pf->indio_dev->trig);
+
+	return IRQ_HANDLED;
+}
+
+static int qcom_smgr_accel_trigger_set_state(struct iio_trigger *trig,
+					     bool state)
 {
 	return 0;
 }
 
 static const struct iio_trigger_ops qcom_smgr_accel_trigger_ops = {
 	.set_trigger_state = qcom_smgr_accel_trigger_set_state,
+	.validate_device = iio_trigger_validate_own_device,
 };
 
 static int qcom_smgr_accel_probe(struct platform_device *pdev)
@@ -98,22 +111,25 @@ static int qcom_smgr_accel_probe(struct platform_device *pdev)
 
 	iio_dev->name = "qcom-smgr-accel";
 	iio_dev->info = &qcom_smgr_iio_info;
-	iio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_TRIGGERED;
 	iio_dev->channels = qcom_smgr_accel_iio_channels;
 	iio_dev->num_channels = ARRAY_SIZE(qcom_smgr_accel_iio_channels);
 
-	ret = devm_iio_kfifo_buffer_setup(&pdev->dev, iio_dev,
-					  &qcom_smgr_buffer_ops);
+	ret = devm_iio_triggered_buffer_setup(&pdev->dev, iio_dev,
+					      iio_pollfunc_store_time,
+					      qcom_smgr_accel_trigger_handler,
+					      &qcom_smgr_buffer_ops);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to setup buffer: %pe\n",
+		dev_err(&pdev->dev, "Failed to setup triggered buffer: %pe\n",
 			ERR_PTR(ret));
 		return ret;
 	}
 
-	trig = devm_iio_trigger_alloc(&pdev->dev, "%s", iio_dev->name);
+	trig = devm_iio_trigger_alloc(&pdev->dev, "%s-dev%d", iio_dev->name,
+				      iio_device_id(iio_dev));
 	if (!trig)
 		return -ENOMEM;
 
+	trig->ops = &qcom_smgr_accel_trigger_ops;
 	iio_trigger_set_drvdata(trig, iio_dev);
 
 	ret = devm_iio_trigger_register(&pdev->dev, trig);
