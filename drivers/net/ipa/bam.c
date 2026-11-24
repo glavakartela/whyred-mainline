@@ -5,6 +5,7 @@
  */
 
 #include <linux/dma-mapping.h>
+#include <linux/dma/qcom_bam_dma.h>
 #include <linux/dmaengine.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
@@ -22,7 +23,6 @@
  */
 #define BAM_POLL_MS	2
 
-void bam_dma_poll(struct dma_chan *chan);
 #include "ipa_dma_private.h"
 #include "ipa_endpoint.h"
 #include "ipa_gsi.h"
@@ -32,9 +32,11 @@ void bam_dma_poll(struct dma_chan *chan);
  * DOC: The IPA Smart Peripheral System Interface
  *
  * IPA v2.x uses BAM rather than GSI as its DMA transport.  Each channel
- * here corresponds to one BAM pipe configured in BAM2BAM mode.  IPA
- * immediate commands are transferred one at a time, each in one BAM
- * transfer.
+ * here corresponds to one BAM pipe configured in system mode: the
+ * descriptor FIFO lives in memory owned by the AP.  The BAM's global
+ * configuration and per-pipe thresholds are set up by the qcom_bam_dma
+ * driver using the "qcom,ipa-bam" device tree properties.  IPA immediate
+ * commands are transferred one at a time, each in one BAM transfer.
  */
 
 /* Consult hardware, move any newly completed transactions to completed state */
@@ -273,6 +275,7 @@ static void bam_channel_teardown_one(struct ipa_dma *bam, u32 channel_id)
 	if (!channel->dma_subsys)
 		return;		/* Ignore uninitialized channels */
 
+	napi_disable(&channel->napi);
 	netif_napi_del(&channel->napi);
 }
 
@@ -300,9 +303,8 @@ static void bam_channel_teardown(struct ipa_dma *bam)
 	mutex_lock(&bam->mutex);
 
 	channel_id = BAM_CHANNEL_COUNT_MAX;
-	do
+	while (channel_id--)
 		bam_channel_teardown_one(bam, channel_id);
-	while (channel_id--);
 
 	mutex_unlock(&bam->mutex);
 }
@@ -392,7 +394,9 @@ static void bam_resume(struct ipa_dma *bam)
 
 static void bam_trans_callback(void *arg)
 {
-	ipa_trans_complete(arg);
+	struct ipa_trans *trans = arg;
+
+	ipa_trans_complete(trans);
 }
 
 static void bam_trans_commit(struct ipa_trans *trans, bool unused)
@@ -422,6 +426,11 @@ static void bam_trans_commit(struct ipa_trans *trans, bool unused)
 		unsigned long dma_flags = 0;
 		struct dma_async_tx_descriptor *desc;
 
+		if (upper_32_bits(addr))
+			dev_err_ratelimited(trans->dma_subsys->dev,
+					    "BAM address 0x%llx exceeds 32 bits (channel %u)\n",
+					    (u64)addr, trans->channel_id);
+
 		byte_count += len;
 		if (cmd_opcode)
 			opcode = *cmd_opcode++;
@@ -431,13 +440,23 @@ static void bam_trans_commit(struct ipa_trans *trans, bool unused)
 			dma_flags |= DMA_PREP_IMM_CMD;
 		}
 
-		if (last_tre)
+		/*
+		 * Immediate commands are each a complete BAM transfer.  The
+		 * downstream SPS command path never batches several immediate
+		 * commands into one transfer, so mark every command descriptor
+		 * end-of-transfer (only the last one carries the callback).
+		 */
+		if (last_tre || channel->command)
 			dma_flags |= DMA_PREP_INTERRUPT;
 
 		desc = dmaengine_prep_slave_single(channel->dma_chan, addr, len,
 						   direction, dma_flags);
-		if (!desc)
+		if (!desc) {
+			dev_err_ratelimited(trans->dma_subsys->dev,
+					    "BAM prep failed: channel %u, %u bytes, flags 0x%lx\n",
+					    trans->channel_id, len, dma_flags);
 			return;
+		}
 
 		if (last_tre) {
 			desc->callback = bam_trans_callback;
@@ -445,19 +464,41 @@ static void bam_trans_commit(struct ipa_trans *trans, bool unused)
 		}
 
 		desc->cookie = dmaengine_submit(desc);
+		if (dma_submit_error(desc->cookie)) {
+			dev_err_ratelimited(trans->dma_subsys->dev,
+					    "BAM submit failed: channel %u, error %d\n",
+					    trans->channel_id, desc->cookie);
+			return;
+		}
 
 		if (last_tre)
 			trans->cookie = desc->cookie;
 
+		/*
+		 * The downstream SPS command path submits one immediate command
+		 * per doorbell; ring the command channel for every command.
+		 */
+		if (channel->command)
+			dma_async_issue_pending(channel->dma_chan);
+
 		/* For RX, the DMA metadata records the received byte count */
-		if (direction == DMA_DEV_TO_MEM)
-			dmaengine_desc_attach_metadata(desc, &trans->len,
-						       sizeof(trans->len));
+		if (direction == DMA_DEV_TO_MEM &&
+		    dmaengine_desc_attach_metadata(desc, &trans->len,
+						   sizeof(trans->len)))
+			dev_err_ratelimited(trans->dma_subsys->dev,
+					    "RX metadata attach failed (channel %u)\n",
+					    trans->channel_id);
 	}
 
-	trans->len = byte_count;
-	if (channel->toward_ipa)
+	/*
+	 * For TX, the transaction length is the number of bytes submitted.
+	 * For RX, bam_dma's metadata fills in trans->len with the number of
+	 * bytes actually received; do not overwrite it here.
+	 */
+	if (channel->toward_ipa) {
+		trans->len = byte_count;
 		gsi_trans_tx_committed(trans);
+	}
 
 	ipa_trans_move_pending(trans);
 

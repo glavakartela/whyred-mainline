@@ -28,9 +28,9 @@
 #include <linux/clk.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma/qcom_bam_dma.h>
 #include <linux/dmaengine.h>
 #include <linux/init.h>
-#include <linux/dma/qcom_bam_dma.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -41,10 +41,6 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
-
-struct dma_chan;
-
-void bam_dma_poll(struct dma_chan *chan);
 
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -297,9 +293,6 @@ static const struct reg_offset_data bam_v2_0_reg_info[] = {
 #define BAM_AU_ACCUMED		BIT(26)
 #define BAM_CMD_ENABLE		BIT(27)
 
-/* BAM CTRL */
-#define BAM_LOCAL_CLK_GATING	GENMASK(18, 17)
-
 #define BAM_CNFG_BITS_DEFAULT	(BAM_PIPE_CNFG |	\
 				 BAM_NO_EXT_P_RST |	\
 				 BAM_IBC_DISABLE |	\
@@ -317,6 +310,16 @@ static const struct reg_offset_data bam_v2_0_reg_info[] = {
 				 BAM_PSM_P_HD_DATA |	\
 				 BAM_AU_ACCUMED |	\
 				 BAM_CMD_ENABLE)
+
+/*
+ * The IPA BAM is configured the way the downstream SPS driver configures
+ * it: all workarounds except BAM_FULL_PIPE, no local clock gating, and no
+ * cache-miss error responses or cancelled-writeback messages.
+ */
+#define BAM_CNFG_BITS_IPA		0xfffff7ff
+#define CACHE_MISS_ERR_RESP_EN		BIT(19)
+#define LOCAL_CLK_GATING		(BIT(17) | BIT(18))
+#define BAM_MESS_ONLY_CANCEL_WB		BIT(20)
 
 /* PIPE CTRL */
 #define P_EN			BIT(1)
@@ -430,13 +433,15 @@ struct bam_device {
 	u32 ee;
 	bool controlled_remotely;
 	bool powered_remotely;
+	bool ipa_bam;
+	u32 event_threshold;
+	u32 desc_threshold;
 	u32 active_channels;
 
 	const struct reg_offset_data *layout;
 
 	struct clk *bamclk;
 	int irq;
-	bool no_local_clk_gating;
 
 	/* dma start transaction tasklet */
 	struct tasklet_struct task;
@@ -516,8 +521,6 @@ static void bam_reset(struct bam_device *bdev)
 	/* s/w reset bam */
 	/* after reset all pipes are disabled and idle */
 	val = readl_relaxed(bam_addr(bdev, 0, BAM_CTRL));
-	if (bdev->no_local_clk_gating)
-		val &= ~BAM_LOCAL_CLK_GATING;
 	val |= BAM_SW_RST;
 	writel_relaxed(val, bam_addr(bdev, 0, BAM_CTRL));
 	val &= ~BAM_SW_RST;
@@ -526,16 +529,22 @@ static void bam_reset(struct bam_device *bdev)
 	/* make sure previous stores are visible before enabling BAM */
 	wmb();
 
+	if (bdev->ipa_bam)
+		val &= ~(CACHE_MISS_ERR_RESP_EN | LOCAL_CLK_GATING |
+			 BAM_MESS_ONLY_CANCEL_WB);
+
 	/* enable bam */
 	val |= BAM_EN;
 	writel_relaxed(val, bam_addr(bdev, 0, BAM_CTRL));
 
-	/* set descriptor threshold, start with 4 bytes */
-	writel_relaxed(DEFAULT_CNT_THRSHLD,
-			bam_addr(bdev, 0, BAM_DESC_CNT_TRSHLD));
+	/* set the descriptor count threshold */
+	writel_relaxed(bdev->desc_threshold,
+		       bam_addr(bdev, 0, BAM_DESC_CNT_TRSHLD));
 
-	/* Enable default set of h/w workarounds, ie all except BAM_FULL_PIPE */
-	writel_relaxed(BAM_CNFG_BITS_DEFAULT, bam_addr(bdev, 0, BAM_CNFG_BITS));
+	/* Enable the workarounds; IPA needs the SPS configuration */
+	writel_relaxed(bdev->ipa_bam ? BAM_CNFG_BITS_IPA :
+			BAM_CNFG_BITS_DEFAULT,
+			bam_addr(bdev, 0, BAM_CNFG_BITS));
 
 	/* enable irqs for errors */
 	writel_relaxed(BAM_ERROR_EN | BAM_HRESP_ERR_EN,
@@ -596,6 +605,12 @@ static void bam_chan_init_hw(struct bam_chan *bchan,
 			bam_addr(bdev, bchan->id, BAM_P_DESC_FIFO_ADDR));
 	writel_relaxed(BAM_FIFO_SIZE,
 			bam_addr(bdev, bchan->id, BAM_P_FIFO_SIZES));
+
+	/* IPA uses the SPS event threshold on each system-mode pipe */
+	if (bdev->event_threshold)
+		writel_relaxed(bdev->event_threshold,
+			       bam_addr(bdev, bchan->id,
+					BAM_P_EVNT_GEN_TRSHLD));
 
 	/* enable the per pipe interrupts, enable EOT, ERR, and INT irqs */
 	writel_relaxed(P_DEFAULT_IRQS_EN,
@@ -762,8 +777,17 @@ static struct dma_async_tx_descriptor *bam_prep_slave_sg(struct dma_chan *chan,
 	if (flags & DMA_PREP_FENCE)
 		async_desc->flags |= DESC_FLAG_NWD;
 
-	if (flags & DMA_PREP_INTERRUPT)
-		async_desc->flags |= DESC_FLAG_EOT;
+	if (flags & DMA_PREP_INTERRUPT) {
+		/*
+		 * SPS uses an interrupt descriptor (not an end-of-transfer
+		 * descriptor) for system-mode RX pipes.  TX and commands use
+		 * end-of-transfer.
+		 */
+		if (bdev->ipa_bam && direction == DMA_DEV_TO_MEM)
+			async_desc->flags |= DESC_FLAG_INT;
+		else
+			async_desc->flags |= DESC_FLAG_EOT;
+	}
 
 	async_desc->num_desc = num_alloc;
 	async_desc->curr_desc = async_desc->desc;
@@ -903,13 +927,9 @@ static int bam_resume(struct dma_chan *chan)
 }
 
 /**
- * process_channel_irqs - processes the channel interrupts
- * @bdev: bam controller
- *
- * This function processes the channel interrupts
- *
+ * bam_chan_process_done - retire descriptors the hardware has finished with
+ * @bchan: BAM channel to process
  */
-/* Retire descriptors the hardware has finished with on one channel */
 static void bam_chan_process_done(struct bam_chan *bchan)
 {
 	struct bam_device *bdev = bchan->bdev;
@@ -1113,7 +1133,12 @@ static void bam_apply_new_config(struct bam_chan *bchan,
 	struct bam_device *bdev = bchan->bdev;
 	u32 maxburst;
 
-	if (!bdev->controlled_remotely) {
+	/*
+	 * The descriptor-count threshold is a global BAM setting.  The IPA
+	 * BAM has a fixed value from its device tree configuration, so do
+	 * not let the per-channel slave maxburst overwrite it.
+	 */
+	if (!bdev->controlled_remotely && !bdev->ipa_bam) {
 		if (dir == DMA_DEV_TO_MEM)
 			maxburst = bchan->slave.src_maxburst;
 		else
@@ -1354,7 +1379,7 @@ static int bam_dma_probe(struct platform_device *pdev)
 	const struct of_device_id *match;
 	int ret, i;
 
-	bdev = devm_kzalloc_obj(&pdev->dev, *bdev);
+	bdev = devm_kzalloc(&pdev->dev, sizeof(*bdev), GFP_KERNEL);
 	if (!bdev)
 		return -ENOMEM;
 
@@ -1382,12 +1407,36 @@ static int bam_dma_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	bdev->ipa_bam = of_property_read_bool(pdev->dev.of_node,
+					      "qcom,ipa-bam");
+
+	ret = of_property_read_u32(pdev->dev.of_node, "qcom,event-threshold",
+				   &bdev->event_threshold);
+	if (ret)
+		bdev->event_threshold = 0;
+	if (bdev->event_threshold > 0xffff) {
+		dev_err(bdev->dev, "invalid event threshold\n");
+		return -EINVAL;
+	}
+
+	ret = of_property_read_u32(pdev->dev.of_node, "qcom,desc-threshold",
+				   &bdev->desc_threshold);
+	if (ret || !bdev->desc_threshold)
+		bdev->desc_threshold = DEFAULT_CNT_THRSHLD;
+	if (bdev->desc_threshold > 0xffff) {
+		dev_err(bdev->dev, "invalid descriptor threshold\n");
+		return -EINVAL;
+	}
+
+	if (bdev->ipa_bam)
+		dev_info(bdev->dev,
+			 "IPA BAM: desc threshold %u, event threshold %u\n",
+			 bdev->desc_threshold, bdev->event_threshold);
+
 	bdev->controlled_remotely = of_property_read_bool(pdev->dev.of_node,
 						"qcom,controlled-remotely");
 	bdev->powered_remotely = of_property_read_bool(pdev->dev.of_node,
 						"qcom,powered-remotely");
-	bdev->no_local_clk_gating = of_property_read_bool(pdev->dev.of_node,
-						"qcom,no-local-clock-gating");
 
 	if (bdev->controlled_remotely || bdev->powered_remotely)
 		bdev->bamclk = devm_clk_get_optional(bdev->dev, "bam_clk");
@@ -1425,8 +1474,8 @@ static int bam_dma_probe(struct platform_device *pdev)
 
 	tasklet_setup(&bdev->task, dma_tasklet);
 
-	bdev->channels = devm_kzalloc_objs(bdev->dev, *bdev->channels,
-					   bdev->num_channels);
+	bdev->channels = devm_kcalloc(bdev->dev, bdev->num_channels,
+				sizeof(*bdev->channels), GFP_KERNEL);
 
 	if (!bdev->channels) {
 		ret = -ENOMEM;
@@ -1439,8 +1488,8 @@ static int bam_dma_probe(struct platform_device *pdev)
 	for (i = 0; i < bdev->num_channels; i++)
 		bam_channel_init(bdev, &bdev->channels[i], i);
 
-	ret = request_irq(bdev->irq, bam_dma_irq, IRQF_TRIGGER_NONE,
-			  "bam_dma", bdev);
+	ret = devm_request_irq(bdev->dev, bdev->irq, bam_dma_irq,
+			IRQF_TRIGGER_HIGH, "bam_dma", bdev);
 	if (ret)
 		goto err_bam_channel_exit;
 
@@ -1474,7 +1523,7 @@ static int bam_dma_probe(struct platform_device *pdev)
 	ret = dma_async_device_register(&bdev->common);
 	if (ret) {
 		dev_err(bdev->dev, "failed to register dma async device\n");
-		goto err_free_irq;
+		goto err_bam_channel_exit;
 	}
 
 	ret = of_dma_controller_register(pdev->dev.of_node, bam_dma_xlate,
@@ -1493,8 +1542,6 @@ static int bam_dma_probe(struct platform_device *pdev)
 
 err_unregister_dma:
 	dma_async_device_unregister(&bdev->common);
-err_free_irq:
-	free_irq(bdev->irq, bdev);
 err_bam_channel_exit:
 	for (i = 0; i < bdev->num_channels; i++)
 		tasklet_kill(&bdev->channels[i].vc.task);
@@ -1520,7 +1567,7 @@ static void bam_dma_remove(struct platform_device *pdev)
 	/* mask all interrupts for this execution environment */
 	writel_relaxed(0, bam_addr(bdev, 0,  BAM_IRQ_SRCS_MSK_EE));
 
-	free_irq(bdev->irq, bdev);
+	devm_free_irq(bdev->dev, bdev->irq, bdev);
 
 	for (i = 0; i < bdev->num_channels; i++) {
 		bam_dma_terminate_all(&bdev->channels[i].vc.chan);
