@@ -503,7 +503,9 @@ static void ipa_hardware_config(struct ipa *ipa, const struct ipa_data *data)
 		iowrite32(0, ipa->reg_virt + reg_offset(reg));
 
 		reg = ipa_reg(ipa, COMP_CFG);
-		iowrite32(1, ipa->reg_virt + reg_offset(reg));
+		iowrite32(reg_bit(reg, COMP_CFG_ENABLE) |
+			  reg_bit(reg, IPA_DCMP_FAST_CLK_EN),
+			  ipa->reg_virt + reg_offset(reg));
 
 		ipa_hardware_config_bcr(ipa, data);
 

@@ -480,7 +480,7 @@ int ipa_mem_zero_modem(struct ipa *ipa)
 	/* Get a transaction to zero the modem memory, modem header,
 	 * and modem processing context regions.
 	 */
-	trans = ipa_cmd_trans_alloc(ipa, 3);
+	trans = ipa_cmd_trans_alloc(ipa, 4);
 	if (!trans) {
 		dev_err(ipa->dev, "no transaction to zero modem memory\n");
 		return -EBUSY;
@@ -488,6 +488,7 @@ int ipa_mem_zero_modem(struct ipa *ipa)
 
 	ipa_mem_zero_region_add(trans, IPA_MEM_MODEM_HEADER);
 	ipa_mem_zero_region_add(trans, IPA_MEM_MODEM_PROC_CTX);
+	ipa_mem_zero_region_add(trans, IPA_MEM_ZIP);
 	ipa_mem_zero_region_add(trans, IPA_MEM_MODEM);
 
 	ipa_trans_commit_wait(trans);

@@ -354,7 +354,7 @@ init_modem_driver_req(struct ipa_qmi *ipa_qmi)
 	if (mem && mem->size) {
 		req.zip_tbl_info_valid = 1;
 		req.zip_tbl_info.start = ipa->mem_offset + mem->offset;
-		req.zip_tbl_info.end = ipa->mem_offset + mem->size - 1;
+		req.zip_tbl_info.end = req.zip_tbl_info.start + mem->size - 1;
 	}
 
 	mem = ipa_mem_find(ipa, IPA_MEM_V4_ROUTE_HASHED);
