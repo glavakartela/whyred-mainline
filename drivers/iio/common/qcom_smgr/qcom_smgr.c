@@ -598,7 +598,7 @@ static const struct iio_mount_matrix qcom_smgr_iio_mount_matrix = {
 	.rotation = {
 		"0", "-1", "0",
 		"-1", "0", "0",
-		"0", "0", "1"
+		"0", "0", "-1"
 	}
 };
 
