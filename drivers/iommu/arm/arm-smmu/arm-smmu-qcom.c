@@ -329,7 +329,18 @@ static bool qcom_adreno_can_do_ttbr1(struct arm_smmu_device *smmu)
 {
 	const struct device_node *np = smmu->dev->of_node;
 
-	if (of_device_is_compatible(np, "qcom,msm8996-smmu-v2"))
+	/*
+	 * A5xx has no per-process pagetables, so split pagetables provide no
+	 * benefit: they only move the global GPU VM into the TTBR1 range
+	 * (bit 48 set) and leave TTBR0 disabled.  On these parts the GPU
+	 * context-switch/address path can lose that upper address bit, which
+	 * turns a valid GPU write into a translation fault in the disabled
+	 * TTBR0 range.  Keep the GPU VM in the low range as the downstream
+	 * 7.2 tree did.
+	 */
+	if (of_device_is_compatible(np, "qcom,msm8996-smmu-v2") ||
+	    of_device_is_compatible(np, "qcom,msm8998-smmu-v2") ||
+	    of_device_is_compatible(np, "qcom,sdm630-smmu-v2"))
 		return false;
 
 	return true;
