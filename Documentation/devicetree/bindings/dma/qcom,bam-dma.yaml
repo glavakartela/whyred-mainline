@@ -75,6 +75,13 @@ properties:
       Indicates supported number of Execution Environments in a remotely
       controlled bam.
 
+  qcom,no-local-clock-gating:
+    type: boolean
+    description:
+      Disable the BAM controller's local clock gating.  This is needed when
+      the BAM is shared with a remote processor and the remote side expects
+      the BAM clock to stay running.
+
   qcom,powered-remotely:
     type: boolean
     description:

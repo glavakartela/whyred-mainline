@@ -297,6 +297,9 @@ static const struct reg_offset_data bam_v2_0_reg_info[] = {
 #define BAM_AU_ACCUMED		BIT(26)
 #define BAM_CMD_ENABLE		BIT(27)
 
+/* BAM CTRL */
+#define BAM_LOCAL_CLK_GATING	GENMASK(18, 17)
+
 #define BAM_CNFG_BITS_DEFAULT	(BAM_PIPE_CNFG |	\
 				 BAM_NO_EXT_P_RST |	\
 				 BAM_IBC_DISABLE |	\
@@ -433,6 +436,7 @@ struct bam_device {
 
 	struct clk *bamclk;
 	int irq;
+	bool no_local_clk_gating;
 
 	/* dma start transaction tasklet */
 	struct tasklet_struct task;
@@ -512,6 +516,8 @@ static void bam_reset(struct bam_device *bdev)
 	/* s/w reset bam */
 	/* after reset all pipes are disabled and idle */
 	val = readl_relaxed(bam_addr(bdev, 0, BAM_CTRL));
+	if (bdev->no_local_clk_gating)
+		val &= ~BAM_LOCAL_CLK_GATING;
 	val |= BAM_SW_RST;
 	writel_relaxed(val, bam_addr(bdev, 0, BAM_CTRL));
 	val &= ~BAM_SW_RST;
@@ -1380,6 +1386,8 @@ static int bam_dma_probe(struct platform_device *pdev)
 						"qcom,controlled-remotely");
 	bdev->powered_remotely = of_property_read_bool(pdev->dev.of_node,
 						"qcom,powered-remotely");
+	bdev->no_local_clk_gating = of_property_read_bool(pdev->dev.of_node,
+						"qcom,no-local-clock-gating");
 
 	if (bdev->controlled_remotely || bdev->powered_remotely)
 		bdev->bamclk = devm_clk_get_optional(bdev->dev, "bam_clk");
