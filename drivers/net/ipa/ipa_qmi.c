@@ -310,6 +310,12 @@ static void ipa_server_filter_notif(struct ipa *ipa, u32 source_pipe,
 		return;
 
 	count = min_t(u32, req->filter_spec_list_len, IPA_QMI_MAX_FILTERS);
+	/* A request that clears the rules carries an empty list; there is
+	 * nothing to confirm and QMI cannot encode a zero-length array.
+	 */
+	if (!count)
+		return;
+
 	notif.source_pipe_index = source_pipe;
 	notif.install_status = QMI_RESULT_SUCCESS_V01;
 	notif.filter_index_list_len = count;
