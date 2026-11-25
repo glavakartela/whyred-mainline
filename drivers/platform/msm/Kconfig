@@ -1,0 +1,4 @@
+menu "Qualcomm MSM platform drivers"
+source "drivers/platform/msm/sps/Kconfig"
+source "drivers/platform/msm/ipa/Kconfig"
+endmenu

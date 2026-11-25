@@ -1,0 +1,29 @@
+config SPS
+	tristate "Qualcomm Smart Peripheral Switch (SPS) BAM driver"
+	depends on ARCH_QCOM || COMPILE_TEST
+	help
+	  Qualcomm SPS (Smart Peripheral Switch) framework. Manages BAM
+	  (Bus Access Manager) peripherals. Required for IPA v2.
+
+	  This driver coexists with mainline qcom_bam_dma (which only
+	  supports BAM-to-system mode); SPS additionally supports BAM2BAM
+	  peer-pipe transfers required by IPA <-> modem interconnect.
+
+	  If unsure, say N.
+
+config SPS_SUPPORT_BAMDMA
+	bool "Include support for BAMDMA"
+	depends on SPS
+	default n
+	help
+	  Include support for BAMDMA. BAMDMA is a memory-to-memory DMA
+	  engine that uses BAM. On modern SoCs (SDM660+) this is rarely
+	  used and can stay disabled.
+
+config SPS_SUPPORT_NDP_BAM
+	bool "Support Non-Dedicated Pipe (NDP) BAM"
+	depends on SPS
+	default y
+	help
+	  Required for modern BAM HW used by IPA on SDM660 and similar.
+	  Keep enabled.

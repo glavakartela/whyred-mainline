@@ -1,0 +1,48 @@
+menu "IPA v2 components"
+	depends on IPA
+
+config IPA_TETH_BRIDGE
+	bool "IPA tethering bridge support"
+	depends on IPA
+	default n
+	help
+	  USB tethering bridge between modem and APPS USB. Optional.
+	  For just-modem-internet (cellular data on rmnet_ipa0) you do
+	  not need this.
+
+	  Adds teth_bridge_driver_init() into the probe path.
+
+config IPA_UC_OFFLOAD_NTN
+	bool "uC offload: Native Network Transport (NTN/Ethernet)"
+	depends on IPA
+	default n
+	help
+	  Enables the IPA microcontroller offload path for Ethernet
+	  (NTN) protocol. Used for hardware-accelerated wired LAN
+	  forwarding via the IPA uC firmware.
+
+	  Not needed for cellular data through rmnet_ipa0.
+
+config IPA_UC_OFFLOAD_WDI
+	bool "uC offload: WLAN Data Interface (WDI/WDI3)"
+	depends on IPA
+	default n
+	help
+	  Enables the IPA microcontroller offload path for WLAN
+	  acceleration. Used to offload TX/RX packet processing to
+	  the IPA uC and bypass the host CPU for WiFi data.
+
+	  Not needed for cellular data through rmnet_ipa0.
+
+config IPA_MHI
+	bool "IPA MHI client support"
+	depends on IPA
+	default n
+	help
+	  Modem Host Interface (MHI) client. For SoC variants with
+	  internal modem (SDM636/660 etc.) this is not used; MHI is
+	  primarily for external PCIe-attached modems.
+
+	  Say N for SoC variants with integrated modem.
+
+endmenu

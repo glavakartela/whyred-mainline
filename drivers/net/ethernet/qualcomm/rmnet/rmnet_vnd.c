@@ -323,6 +323,13 @@ int rmnet_vnd_newlink(u8 id, struct net_device *rmnet_dev,
 	rmnet_dev->hw_features = NETIF_F_RXCSUM;
 	rmnet_dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
 	rmnet_dev->hw_features |= NETIF_F_SG;
+	/* Vendor 4.19 parity: the underlying IPA HW can GRO-coalesce. */
+	rmnet_dev->hw_features |= NETIF_F_GRO_HW;
+
+	/* NETIF_F_IP_CSUM is intentionally NOT enabled in dev->features (only
+	 * in hw_features): the IPA UL csum OFFLOAD is broken on this modem
+	 * (wrong TCP/UDP checksum -> peer drops UL), so UL uses a software
+	 * checksum (tx-checksum off). ethtool -K can re-enable to re-test. */
 
 	priv->real_dev = real_dev;
 

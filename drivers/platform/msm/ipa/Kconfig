@@ -1,0 +1,46 @@
+config IPA
+	tristate "Qualcomm IP Accelerator (IPA) v2 driver"
+	depends on ARCH_QCOM || COMPILE_TEST
+	depends on SPS
+	depends on NET
+	select QCOM_QMI_HELPERS
+	help
+	  Qualcomm IP Accelerator (IPA) v2 driver. Used on Snapdragon SoCs
+	  with integrated modem (e.g. SDM636/660 with IPA HW v2.6L) to
+	  accelerate the data path between application processor and
+	  modem subsystem (Q6 / MSS / MPSS).
+
+	  This driver provides:
+	   * Hardware-accelerated NAT/filter/routing/header processing
+	   * QMI control plane to the modem (IPA_DRIVER_SVC)
+	   * The /dev/ipa character device for IPACM userspace daemon
+	   * The rmnet_ipa0 network device for cellular data
+
+	  If unsure, say N.
+
+config RMNET_IPA
+	tristate "RmNet IPA network driver"
+	depends on IPA
+	select QCOM_RPROC_COMMON
+	help
+	  Provides rmnet_ipa0 netdev and /dev/wwan_ioctl character device
+	  used by IPACM to install filter rules and query stats. Required
+	  for cellular data through the IPA hardware accelerator.
+
+	  This driver registers a QMI client/server pair that handshakes
+	  with the modem's IPA driver counterpart over QRTR. After the
+	  handshake completes, IPACM in userspace can install rules and
+	  the modem starts pumping packets through rmnet_ipa0.
+
+	  If unsure, say N.
+
+config IPA_DEBUG
+	bool "IPA debug verbose logging"
+	depends on IPA
+	help
+	  Enables IPADBG and IPA_SONDA macros to emit verbose tracing
+	  output via trace_printk(). Useful during bring-up.
+
+	  If unsure, say N.
+
+source "drivers/platform/msm/ipa/ipa_v2/Kconfig"
