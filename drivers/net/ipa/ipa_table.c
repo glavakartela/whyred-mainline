@@ -11,6 +11,7 @@
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 
 #include "ipa_dma.h"
 #include "ipa_trans.h"
@@ -21,6 +22,9 @@
 #include "ipa_reg.h"
 #include "ipa_table.h"
 #include "ipa_version.h"
+
+static int ipa_v2_dl_setup(struct ipa *ipa);
+static void ipa_ap_route_setup(struct ipa *ipa);
 
 /**
  * DOC: IPA Filter and Route Tables
@@ -442,6 +446,13 @@ static void ipa_table_init_add(struct ipa_trans *trans, bool filter, bool ipv6)
 	hash_size = hash_count * IPA_TABLE_ENTRY_SIZE(ipa->version);
 
 	addr = ipa_table_addr(ipa, filter, count);
+	if (filter && ipa->filter_table_virt) {
+		addr = ipa->filter_table_addr;
+		if (ipv6 && ipa->filter_table_virt_v6)
+			addr = ipa->filter_table_addr_v6;
+	}
+	if (!filter && ipa->route_table_virt)
+		addr = ipa->route_table_addr;
 	hash_addr = ipa_table_addr(ipa, filter, hash_count);
 
 	ipa_cmd_table_init_add(trans, opcode, size, mem->offset, addr,
@@ -469,6 +480,15 @@ static void ipa_table_init_add(struct ipa_trans *trans, bool filter, bool ipv6)
 int ipa_table_setup(struct ipa *ipa)
 {
 	struct ipa_trans *trans;
+	int ret;
+
+	/* Make sure the modem's TX pipe has a rule that delivers downlink
+	 * traffic to the AP before the tables are programmed, rather than
+	 * waiting for a QMI INSTALL_FILTER_RULE request from the modem.
+	 */
+	ret = ipa_v2_dl_setup(ipa);
+	if (ret)
+		return ret;
 
 	/* We will need at most 8 TREs:
 	 * - IPv4:
@@ -495,6 +515,9 @@ int ipa_table_setup(struct ipa *ipa)
 	ipa_table_init_add(trans, true, true);
 
 	ipa_trans_commit_wait(trans);
+
+	if (ipa->version <= IPA_VERSION_2_6L)
+		ipa_ap_route_setup(ipa);
 
 	return 0;
 }
@@ -747,15 +770,235 @@ static void *ipa_table_write(enum ipa_version version, void *virt, u64 value)
 	return virt + IPA_TABLE_ENTRY_SIZE(version);
 }
 
+#define IPA_AP_RULE_SIZE		(sizeof(__le32) * 5)
+/* Route table entry the AP uses for modem -> AP (WAN) downlink traffic */
+#define IPA_V2_WAN_RT			8
+#define IPA_AP_FILTER_RULE_SIZE		20
+#define IPA_V2_ENDP_INIT_ROUTE_OFFSET	0x370
+#define IPA_V2_FLT_RULE_MAX_SIZE	256
+#define IPA_V2_ROUTE_RULE_SIZE		32
+
+/* Match-all filter rule: a masked comparison with a zero mask matches
+ * anything, and the routing table index selects the AP route table.
+ */
+static u8 *ipa_flt_rule_write_match_all(u8 *buf, u32 rt_index)
+{
+	u8 *ptr = buf;
+	u32 hdr;
+
+	hdr = 4;			/* one offset_meq_32 equation */
+	hdr |= (rt_index & 0x1f) << 21;
+	put_unaligned_le32(hdr, ptr);
+	ptr += sizeof(u32);
+
+	*ptr++ = 16;			/* offset (zero mask matches any) */
+	ptr = (u8 *)ALIGN((unsigned long)ptr, sizeof(u32));
+	put_unaligned_le32(0, ptr);	/* mask */
+	ptr += sizeof(u32);
+	put_unaligned_le32(0, ptr);	/* value */
+	ptr += sizeof(u32);
+
+	return ptr;
+}
+
+/* Match-all route rule, delivering packets to an endpoint */
+static u8 *ipa_rt_rule_write_match_all(u8 *buf, u32 pipe, bool proc_ctx)
+{
+	u8 *ptr = buf;
+	u32 hdr;
+
+	hdr = 4;			/* one offset_meq_32 equation */
+	hdr |= (pipe & 0x1f) << 16;
+	hdr |= BIT(21);			/* rule resides in system memory */
+	if (proc_ctx)
+		hdr |= BIT(31);		/* use a header processing context */
+	put_unaligned_le32(hdr, ptr);
+	ptr += sizeof(u32);
+
+	*ptr++ = 16;
+	ptr = (u8 *)ALIGN((unsigned long)ptr, sizeof(u32));
+	put_unaligned_le32(0, ptr);
+	ptr += sizeof(u32);
+	put_unaligned_le32(0, ptr);
+	ptr += sizeof(u32);
+
+	return ptr;
+}
+
+/* Return the filter table slot used for a filtering endpoint */
+static u32 ipa_filter_slot(struct ipa *ipa, u32 endpoint_id)
+{
+	u64 below;
+
+	below = ipa->filtered & (BIT_ULL(endpoint_id) - 1);
+
+	return 1 + hweight64(below);
+}
+
+/* Install the default downlink rules.
+ *
+ * Downlink packets enter the IPA from the modem's TX pipe (endpoint 6)
+ * and must be routed to the AP's WAN consumer pipe (endpoint 5).  Do
+ * this at set-up time: until a filter rule exists the modem's pipe
+ * matches nothing and every downlink packet is dropped, which shows up
+ * as zero RX on the modem netdev.
+ */
+static int ipa_v2_dl_setup(struct ipa *ipa)
+{
+	struct ipa_endpoint *dl_endpoint;
+	struct ipa_endpoint *rx_endpoint;
+	u8 *rule;
+	u32 slot;
+
+	if (ipa->version > IPA_VERSION_2_6L)
+		return 0;
+
+	dl_endpoint = ipa->name_map[IPA_ENDPOINT_MODEM_LAN_TX];
+	rx_endpoint = ipa->name_map[IPA_ENDPOINT_AP_MODEM_RX];
+	if (!dl_endpoint || !rx_endpoint ||
+	    !ipa->filter_table_virt || !ipa->filter_table_virt_v6 ||
+	    !ipa->route_table_virt)
+		return 0;	/* Nothing to do (or not IPA v2.x) */
+
+	slot = ipa_filter_slot(ipa, dl_endpoint->endpoint_id);
+	if (slot >= 1 + ipa->filter_count)
+		return -EINVAL;
+
+	if (!ipa->pipe_5_route_rule_virt) {
+		rule = dma_alloc_coherent(ipa->dev, IPA_V2_ROUTE_RULE_SIZE,
+					  &ipa->pipe_5_route_rule_addr,
+					  GFP_KERNEL);
+		if (!rule)
+			return -ENOMEM;
+		memset(rule, 0, IPA_V2_ROUTE_RULE_SIZE);
+		ipa->pipe_5_route_rule_virt = rule;
+		rule = ipa_rt_rule_write_match_all(rule,
+						   rx_endpoint->endpoint_id,
+						   false);
+		put_unaligned_le32(0, rule);
+	}
+
+	if (!ipa->dl_flt_rule_virt) {
+		rule = dma_alloc_coherent(ipa->dev, IPA_V2_FLT_RULE_MAX_SIZE,
+					  &ipa->dl_flt_rule_addr, GFP_KERNEL);
+		if (!rule)
+			return -ENOMEM;
+		ipa->dl_flt_rule_size = IPA_V2_FLT_RULE_MAX_SIZE;
+		memset(rule, 0, ipa->dl_flt_rule_size);
+		ipa->dl_flt_rule_virt = rule;
+		rule = ipa_flt_rule_write_match_all(rule, IPA_V2_WAN_RT);
+		put_unaligned_le32(0, rule);
+	}
+
+	/* Both IP versions filter on the modem's TX pipe */
+	((__le32 *)ipa->filter_table_virt)[slot] =
+		cpu_to_le32((u32)ipa->dl_flt_rule_addr);
+	((__le32 *)ipa->filter_table_virt_v6)[slot] =
+		cpu_to_le32((u32)ipa->dl_flt_rule_addr);
+
+	/* Downlink packets matching the rule go to the AP WAN consumer */
+	((__le32 *)ipa->route_table_virt)[IPA_V2_WAN_RT] =
+		cpu_to_le32((u32)ipa->pipe_5_route_rule_addr);
+
+	return 0;
+}
+
+/* Install the match-all route used by the AP->modem TX endpoint.
+ *
+ * The route table is split between the modem (low entries) and the AP
+ * (high entries); the split point is ipa->modem_route_count.  The
+ * hardware hashes a packet into the AP's contiguous range, so every
+ * entry in that range must refer to a rule, and the endpoint must be
+ * told where the range starts.
+ */
+static void ipa_ap_route_setup(struct ipa *ipa)
+{
+	struct ipa_endpoint *endpoint;
+	const struct ipa_mem *mem;
+	struct ipa_trans *trans;
+	u32 endpoint_id;
+	u32 first;
+	u32 count;
+	u32 offset;
+	u32 i;
+
+	if (ipa->version > IPA_VERSION_2_6L)
+		return;
+
+	if (!ipa->route_table_virt || !ipa->ap_route_rule_virt)
+		return;
+
+	first = ipa->modem_route_count;
+	count = ipa->route_count - first;
+	if (!count)
+		return;
+
+	/* IPA v2.x hashes every packet over the whole route table, not
+	 * just the AP's share, so a hash into the modem's range must also
+	 * resolve to a valid rule.  Fill the entire table with the
+	 * match-all rule; the modem later overwrites its own entries.
+	 */
+	for (i = 0; i < ipa->route_count; i++)
+		((__le32 *)ipa->route_table_virt)[i] =
+			cpu_to_le32((u32)ipa->ap_route_rule_addr);
+
+	/* The WAN downlink entry points at the AP WAN consumer rule */
+	if (ipa->pipe_5_route_rule_virt)
+		((__le32 *)ipa->route_table_virt)[IPA_V2_WAN_RT] =
+			cpu_to_le32((u32)ipa->pipe_5_route_rule_addr);
+
+	trans = ipa_cmd_trans_alloc(ipa, 2);
+	if (!trans) {
+		dev_err(ipa->dev, "no transaction for AP route table\n");
+		return;
+	}
+
+	mem = ipa_mem_find(ipa, IPA_MEM_V4_ROUTE);
+	if (mem)
+		ipa_cmd_table_init_add(trans, IPA_CMD_IP_V4_ROUTING_INIT,
+				       mem->size, mem->offset,
+				       ipa->route_table_addr, 0, 0, 0);
+
+	mem = ipa_mem_find(ipa, IPA_MEM_V6_ROUTE);
+	if (mem)
+		ipa_cmd_table_init_add(trans, IPA_CMD_IP_V6_ROUTING_INIT,
+				       mem->size, mem->offset,
+				       ipa->route_table_addr, 0, 0, 0);
+
+	ipa_trans_commit_wait(trans);
+
+	endpoint = ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX];
+	if (!endpoint)
+		return;
+
+	endpoint_id = endpoint->endpoint_id;
+	offset = IPA_V2_ENDP_INIT_ROUTE_OFFSET + endpoint_id * sizeof(u32);
+	iowrite32(first, (u8 *)ipa->reg_virt + offset);
+}
+
 int ipa_table_init(struct ipa *ipa)
 {
 	struct device *dev = ipa->dev;
 	enum ipa_version version = ipa->version;
 	u64 filtered = ipa->filtered;
+	dma_addr_t filter_addr;
+	dma_addr_t filter_addr_v6;
+	dma_addr_t filter_rule_addr;
+	dma_addr_t route_addr;
+	dma_addr_t rule_addr;
+	void *filter_virt;
+	void *filter_virt_v6;
+	void *filter_rule_virt;
+	void *route_virt;
+	void *rule_virt;
 	dma_addr_t addr;
 	void *virt;
+	size_t filter_size;
+	size_t route_size;
 	size_t size;
 	u32 count;
+	u32 i;
+	u32 val;
 
 	ipa_table_validate_build();
 
@@ -796,7 +1039,134 @@ int ipa_table_init(struct ipa *ipa)
 	while (count--)
 		virt = ipa_table_write(version, virt, addr);
 
+	if (version > IPA_VERSION_2_6L)
+		return 0;
+
+	/* IPA v2.x route tables are installed from system memory.  Keep a
+	 * separate route table buffer so filter and route entries cannot
+	 * overlap, and so the route table can be re-installed as a whole.
+	 */
+	route_size = ipa->route_count * IPA_TABLE_ENTRY_SIZE(version);
+	route_virt = dma_alloc_coherent(dev, route_size, &route_addr,
+					GFP_KERNEL);
+	if (!route_virt)
+		goto err_free_table;
+	for (i = 0; i < ipa->route_count; i++)
+		((__le32 *)route_virt)[i] = cpu_to_le32((u32)addr);
+
+	rule_virt = dma_alloc_coherent(dev, IPA_AP_RULE_SIZE, &rule_addr,
+				       GFP_KERNEL);
+	if (!rule_virt)
+		goto err_free_route;
+
+	/* Route rule: match-all, destination modem LAN RX pipe (Q6_LAN_CONS,
+	 * endpoint 8).  The modem's own UL route rules (route table entries
+	 * 1/2) also target Q6_LAN_CONS, so the AP default must match.
+	 *
+	 * The hardware does not treat an equation-less rule as a match-all,
+	 * so use one meq32 equation with a zero mask; the offset selects
+	 * the IPv4 destination address but the zero mask makes it match
+	 * any packet (and any IP version).
+	 */
+	if (!ipa->name_map[IPA_ENDPOINT_MODEM_LAN_RX])
+		goto err_free_rule;
+	val = ipa->name_map[IPA_ENDPOINT_MODEM_LAN_RX]->endpoint_id << 16;
+	val |= 1 << 21;			/* rule resides in system memory */
+	val |= 4;			/* IPA_OFFSET_MEQ32_0 */
+	((__le32 *)rule_virt)[0] = cpu_to_le32(val);
+	((__le32 *)rule_virt)[1] = cpu_to_le32(16);	/* IPv4 dst offset */
+	((__le32 *)rule_virt)[2] = 0;			/* mask: match any */
+	((__le32 *)rule_virt)[3] = 0;			/* value */
+	((__le32 *)rule_virt)[4] = 0;			/* rule terminator */
+
+	ipa->route_table_addr = route_addr;
+	ipa->route_table_virt = route_virt;
+	ipa->route_table_size = route_size;
+	ipa->ap_route_rule_addr = rule_addr;
+	ipa->ap_route_rule_virt = rule_virt;
+
+	/* AP filter rule: default match-all, pass to routing, route to the
+	 * AP's share of the route table.
+	 */
+	filter_rule_virt = dma_alloc_coherent(dev, IPA_AP_FILTER_RULE_SIZE,
+					      &filter_rule_addr, GFP_KERNEL);
+	if (!filter_rule_virt)
+		goto err_free_rule;
+	/* Match-all IPv4 filter rule using meq32 at offset 12 with a zero
+	 * mask/value pair, then pass to routing with the AP route table.
+	 */
+	val = 4;					/* IPA_OFFSET_MEQ32_0 */
+	val |= ipa->modem_route_count << 21;
+	((__le32 *)filter_rule_virt)[0] = cpu_to_le32(val);
+	((u8 *)filter_rule_virt)[4] = 12;		/* IPv4 source address */
+	((u8 *)filter_rule_virt)[16] = 0;		/* rule terminator */
+
+	/* Filter table: bitmap plus one entry per filtered endpoint. */
+	filter_size = (1 + ipa->filter_count) *
+		      IPA_TABLE_ENTRY_SIZE(version);
+	filter_virt = dma_alloc_coherent(dev, filter_size, &filter_addr,
+					 GFP_KERNEL);
+	if (!filter_virt)
+		goto err_free_filter_rule;
+	val = (u32)ipa->filtered << 1;
+	((__le32 *)filter_virt)[0] = cpu_to_le32(val);
+	for (i = 1; i < 1 + ipa->filter_count; i++)
+		((__le32 *)filter_virt)[i] = cpu_to_le32((u32)addr);
+
+	/* Install the AP match-all filter rule on the AP->modem TX endpoint
+	 * so unmatched uplink traffic routes through the AP's share of the
+	 * route table (ENDP_INIT_ROUTE) instead of the zero rule.
+	 */
+	if (ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX]) {
+		u32 ul_slot = ipa_filter_slot(ipa,
+			ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX]->endpoint_id);
+
+		if (ul_slot < 1 + ipa->filter_count)
+			((__le32 *)filter_virt)[ul_slot] =
+				cpu_to_le32((u32)filter_rule_addr);
+	}
+
+	ipa->filter_table_addr = filter_addr;
+	ipa->filter_table_virt = filter_virt;
+	ipa->filter_table_size = filter_size;
+
+	/* The v4 and v6 filter tables have different rules for the modem's
+	 * TX pipe, so keep a separate copy for IPv6.
+	 */
+	filter_virt_v6 = dma_alloc_coherent(dev, filter_size,
+					    &filter_addr_v6, GFP_KERNEL);
+	if (!filter_virt_v6)
+		goto err_free_filter;
+	memcpy(filter_virt_v6, filter_virt, filter_size);
+	ipa->filter_table_addr_v6 = filter_addr_v6;
+	ipa->filter_table_virt_v6 = filter_virt_v6;
+	ipa->filter_table_size_v6 = filter_size;
+
+	ipa->ap_filter_rule_addr = filter_rule_addr;
+	ipa->ap_filter_rule_virt = filter_rule_virt;
+
 	return 0;
+
+err_free_filter:
+	dma_free_coherent(dev, filter_size, filter_virt, filter_addr);
+err_free_filter_rule:
+	dma_free_coherent(dev, IPA_AP_FILTER_RULE_SIZE, filter_rule_virt,
+			  filter_rule_addr);
+err_free_rule:
+	ipa->route_table_virt = NULL;
+	ipa->route_table_addr = 0;
+	ipa->route_table_size = 0;
+	ipa->ap_route_rule_virt = NULL;
+	ipa->ap_route_rule_addr = 0;
+	dma_free_coherent(dev, IPA_AP_RULE_SIZE, rule_virt, rule_addr);
+err_free_route:
+	dma_free_coherent(dev, route_size, route_virt, route_addr);
+err_free_table:
+	dma_free_coherent(dev, size, ipa->table_virt, ipa->table_addr);
+	ipa->table_addr = 0;
+	ipa->table_virt = NULL;
+
+	return -ENOMEM;
 }
 
 void ipa_table_exit(struct ipa *ipa)
@@ -807,6 +1177,60 @@ void ipa_table_exit(struct ipa *ipa)
 
 	size = IPA_ZERO_RULE_SIZE(ipa->version) +
        (1 + count) * IPA_TABLE_ENTRY_SIZE(ipa->version);
+
+	if (ipa->dl_flt_rule_virt) {
+		dma_free_coherent(dev, ipa->dl_flt_rule_size,
+				  ipa->dl_flt_rule_virt,
+				  ipa->dl_flt_rule_addr);
+		ipa->dl_flt_rule_virt = NULL;
+		ipa->dl_flt_rule_addr = 0;
+		ipa->dl_flt_rule_size = 0;
+	}
+	if (ipa->pipe_5_route_rule_virt) {
+		dma_free_coherent(dev, IPA_V2_ROUTE_RULE_SIZE,
+				  ipa->pipe_5_route_rule_virt,
+				  ipa->pipe_5_route_rule_addr);
+		ipa->pipe_5_route_rule_virt = NULL;
+		ipa->pipe_5_route_rule_addr = 0;
+	}
+	if (ipa->ap_filter_rule_virt) {
+		dma_free_coherent(dev, IPA_AP_FILTER_RULE_SIZE,
+				  ipa->ap_filter_rule_virt,
+				  ipa->ap_filter_rule_addr);
+		ipa->ap_filter_rule_virt = NULL;
+		ipa->ap_filter_rule_addr = 0;
+	}
+	if (ipa->ap_route_rule_virt) {
+		dma_free_coherent(dev, IPA_AP_RULE_SIZE,
+				  ipa->ap_route_rule_virt,
+				  ipa->ap_route_rule_addr);
+		ipa->ap_route_rule_virt = NULL;
+		ipa->ap_route_rule_addr = 0;
+	}
+	if (ipa->filter_table_virt_v6) {
+		dma_free_coherent(dev, ipa->filter_table_size_v6,
+				  ipa->filter_table_virt_v6,
+				  ipa->filter_table_addr_v6);
+		ipa->filter_table_virt_v6 = NULL;
+		ipa->filter_table_addr_v6 = 0;
+		ipa->filter_table_size_v6 = 0;
+	}
+	if (ipa->filter_table_virt) {
+		dma_free_coherent(dev, ipa->filter_table_size,
+				  ipa->filter_table_virt,
+				  ipa->filter_table_addr);
+		ipa->filter_table_virt = NULL;
+		ipa->filter_table_addr = 0;
+		ipa->filter_table_size = 0;
+	}
+	if (ipa->route_table_virt) {
+		dma_free_coherent(dev, ipa->route_table_size,
+				  ipa->route_table_virt,
+				  ipa->route_table_addr);
+		ipa->route_table_virt = NULL;
+		ipa->route_table_addr = 0;
+		ipa->route_table_size = 0;
+	}
 
 	dma_free_coherent(dev, size, ipa->table_virt, ipa->table_addr);
 	ipa->table_addr = 0;

@@ -87,6 +87,31 @@ struct ipa {
 	u32 modem_route_count;
 	u32 filter_count;
 
+	/* IPA v2.x filter and route tables kept in system memory */
+	dma_addr_t filter_table_addr;
+	void *filter_table_virt;
+	size_t filter_table_size;
+	dma_addr_t filter_table_addr_v6;
+	void *filter_table_virt_v6;
+	size_t filter_table_size_v6;
+
+	dma_addr_t route_table_addr;
+	void *route_table_virt;
+	size_t route_table_size;
+
+	dma_addr_t ap_filter_rule_addr;
+	void *ap_filter_rule_virt;
+
+	dma_addr_t ap_route_rule_addr;
+	void *ap_route_rule_virt;
+
+	dma_addr_t dl_flt_rule_addr;
+	void *dl_flt_rule_virt;
+	size_t dl_flt_rule_size;
+
+	dma_addr_t pipe_5_route_rule_addr;
+	void *pipe_5_route_rule_virt;
+
 	struct ipa_interrupt *interrupt;
 	bool uc_powered;
 	bool uc_loaded;
