@@ -9,6 +9,7 @@
 #include <linux/types.h>
 
 #include "ipa.h"
+#include "ipa_data_format.h"
 #include "ipa_mem.h"
 #include "ipa_modem.h"
 #include "ipa_qmi_msg.h"
@@ -143,8 +144,13 @@ static void ipa_qmi_ready(struct ipa_qmi *ipa_qmi)
 	/* We're ready.  Start up normal operation */
 	ipa = container_of(ipa_qmi, struct ipa, qmi);
 	ret = ipa_modem_start(ipa);
-	if (ret)
+	if (ret) {
 		dev_err(ipa->dev, "error %d starting modem\n", ret);
+		return;
+	}
+
+	/* Now that the modem's IPA is ready, map its data port */
+	ipa_data_format_start(ipa);
 }
 
 /* All QMI clients from the modem node are gone (modem shut down or crashed). */
@@ -156,6 +162,9 @@ static void ipa_server_bye(struct qmi_handle *qmi, unsigned int node)
 
 	/* The modem client and server go away at the same time */
 	memset(&ipa_qmi->modem_sq, 0, sizeof(ipa_qmi->modem_sq));
+
+	/* The negotiated data-port mapping went away with the modem */
+	ipa_data_format_stop(container_of(ipa_qmi, struct ipa, qmi));
 
 	/* initial_boot doesn't change when modem reboots */
 	/* uc_ready doesn't change when modem reboots */
@@ -519,6 +528,14 @@ int ipa_qmi_setup(struct ipa *ipa)
 	if (ret)
 		goto err_client_handle_release;
 
+	/* Data-port mapping is optional; the modem path still works
+	 * without it, just with the modem's default framing.
+	 */
+	ret = ipa_data_format_setup(ipa);
+	if (ret)
+		dev_warn(ipa->dev,
+			 "unable to set up data-port mapping: %d\n", ret);
+
 	return 0;
 
 err_client_handle_release:
@@ -554,9 +571,14 @@ void ipa_qmi_teardown(struct ipa *ipa)
 {
 	cancel_work_sync(&ipa->qmi.init_driver_work);
 
-	qmi_handle_release(&ipa->qmi.client_handle);
-	memset(&ipa->qmi.client_handle, 0, sizeof(ipa->qmi.client_handle));
-
+	/* Stop the server handle first: its "bye" callback can reach the
+	 * data-port state, which is freed below.
+	 */
 	qmi_handle_release(&ipa->qmi.server_handle);
 	memset(&ipa->qmi.server_handle, 0, sizeof(ipa->qmi.server_handle));
+
+	ipa_data_format_teardown(ipa);
+
+	qmi_handle_release(&ipa->qmi.client_handle);
+	memset(&ipa->qmi.client_handle, 0, sizeof(ipa->qmi.client_handle));
 }

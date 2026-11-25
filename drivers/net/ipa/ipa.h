@@ -17,6 +17,7 @@
 
 struct net_device;
 
+struct ipa_data_format;
 struct ipa_interrupt;
 struct ipa_power;
 struct ipa_smp2p;
@@ -136,6 +137,7 @@ struct ipa {
 
 	atomic_t modem_state;		/* enum ipa_modem_state */
 	struct net_device *modem_netdev;
+	struct ipa_data_format *data_format;
 	struct ipa_qmi qmi;
 };
 
