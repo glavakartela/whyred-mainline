@@ -366,7 +366,10 @@ struct ipa_filter_spec {
  */
 struct ipa_install_fltr_rule_req {
 	u8 filter_spec_list_valid;
-	u8 filter_spec_list_len;
+	/* Lengths are u32 in the shared QMI structures even though the
+	 * wire TLV carries a single byte; the encoder reads 32 bits.
+	 */
+	u32 filter_spec_list_len;
 	struct ipa_filter_spec filter_spec_list[IPA_QMI_MAX_FILTERS];
 };
 
@@ -379,7 +382,7 @@ struct ipa_filter_handle {
 struct ipa_install_fltr_rule_rsp {
 	struct qmi_response_type_v01 rsp;
 	u8 filter_handle_list_valid;
-	u8 filter_handle_list_len;
+	u32 filter_handle_list_len;
 	struct ipa_filter_handle filter_handle_list[IPA_QMI_MAX_FILTERS];
 };
 
@@ -392,7 +395,7 @@ struct ipa_filter_handle_index {
 struct ipa_fltr_installed_notif_req {
 	u32 source_pipe_index;
 	u16 install_status;
-	u8 filter_index_list_len;
+	u32 filter_index_list_len;
 	struct ipa_filter_handle_index filter_index_list[IPA_QMI_MAX_FILTERS];
 };
 

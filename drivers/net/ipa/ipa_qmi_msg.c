@@ -1119,8 +1119,7 @@ const struct qmi_elem_info ipa_install_fltr_rule_req_ei[] = {
 	{
 		.data_type	= QMI_DATA_LEN,
 		.elem_len	= 1,
-		.elem_size	= sizeof_field(struct ipa_install_fltr_rule_req,
-					       filter_spec_list_len),
+		.elem_size	= sizeof(u8),
 		.tlv_type	= 0x10,
 		.offset		= offsetof(struct ipa_install_fltr_rule_req,
 					   filter_spec_list_len),
@@ -1183,8 +1182,7 @@ const struct qmi_elem_info ipa_install_fltr_rule_rsp_ei[] = {
 	{
 		.data_type	= QMI_DATA_LEN,
 		.elem_len	= 1,
-		.elem_size	= sizeof_field(struct ipa_install_fltr_rule_rsp,
-					       filter_handle_list_len),
+		.elem_size	= sizeof(u8),
 		.tlv_type	= 0x10,
 		.offset		= offsetof(struct ipa_install_fltr_rule_rsp,
 					   filter_handle_list_len),
@@ -1246,8 +1244,7 @@ const struct qmi_elem_info ipa_fltr_installed_notif_req_ei[] = {
 	{
 		.data_type	= QMI_DATA_LEN,
 		.elem_len	= 1,
-		.elem_size	= sizeof_field(struct ipa_fltr_installed_notif_req,
-					       filter_index_list_len),
+		.elem_size	= sizeof(u8),
 		.tlv_type	= 0x03,
 		.offset		= offsetof(struct ipa_fltr_installed_notif_req,
 					   filter_index_list_len),
