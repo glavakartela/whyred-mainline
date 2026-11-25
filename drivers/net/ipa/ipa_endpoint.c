@@ -87,6 +87,9 @@ enum ipa_status_mask {
 /* Special IPA filter/router rule field value indicating "rule miss" */
 #define IPA_STATUS_RULE_MISS	0x3ff	/* 10-bit filter/router rule fields */
 
+/* Tag written by the IPA tag process for pipeline synchronization */
+#define IPA_COOKIE		0x57831603
+
 /** The IPA status nat_type field uses enum ipa_nat_type hardware values */
 
 /* enum ipa_status_field_id - IPA packet status structure field identifiers */
@@ -1502,8 +1505,12 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 	u32 endpoint_id;
 
 	status_mask = ipa_status_extract(ipa, data, STATUS_MASK);
-	if (!status_mask)
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		if (!(status_mask & IPA_STATUS_MASK_TAG_VALID))
+			return false;	/* No valid tag */
+	} else if (!status_mask) {
 		return false;	/* No valid tag */
+	}
 
 	/* The status contains a valid tag.  We know the packet was sent to
 	 * this endpoint (already verified by ipa_endpoint_status_skip()).
@@ -1514,6 +1521,32 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 	command_endpoint = ipa->name_map[IPA_ENDPOINT_AP_COMMAND_TX];
 	if (endpoint_id == command_endpoint->endpoint_id) {
 		complete(&ipa->completion);
+	} else if (ipa->version <= IPA_VERSION_2_6L) {
+		u32 tag_low32;
+		u32 tag_high16;
+
+		tag_low32 = ipa_status_extract(ipa, data, STATUS_TAG_LOW32);
+		tag_high16 = ipa_status_extract(ipa, data, STATUS_TAG_HIGH16);
+
+		/* A cookie-tagged status is a pipeline flush/synchronization
+		 * marker, not data: consume it without reporting an error.
+		 */
+		if (tag_high16 == (IPA_COOKIE >> 16) &&
+		    (tag_low32 >> 16) == (IPA_COOKIE & 0xffff)) {
+			dev_dbg(ipa->dev,
+				"IPA tag process status from endpoint %u\n",
+				endpoint_id);
+			return true;
+		}
+
+		/* IPA v2.6L tags ordinary WAN downlink data with a
+		 * non-cookie tag.  Dropping those packets leaves the modem
+		 * netdev with RX == 0 even though the downlink arrives.
+		 */
+		dev_dbg_ratelimited(ipa->dev,
+				    "tagged data from endpoint %u, delivering\n",
+				    endpoint_id);
+		return false;
 	} else {
 		dev_err(ipa->dev, "unexpected tagged packet from endpoint %u\n",
 			endpoint_id);
