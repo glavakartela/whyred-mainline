@@ -13,6 +13,8 @@
 static const char *ipa_version_string(struct ipa *ipa)
 {
 	switch (ipa->version) {
+	case IPA_VERSION_2_0:
+		return "2.0";
 	case IPA_VERSION_2_5:
 		return "2.5";
 	case IPA_VERSION_2_6L:
@@ -71,8 +73,24 @@ const struct attribute_group ipa_attribute_group = {
 	.attrs		= ipa_attrs,
 };
 
-static const char *ipa_offload_string(struct ipa *ipa)
+static const char *ipa_offload_string(struct ipa *ipa, bool rx)
 {
+	struct ipa_endpoint *endpoint;
+	enum ipa_endpoint_name name;
+
+	/* Report the offload mode each modem endpoint is actually
+	 * configured for.  With checksum offload disabled the hardware uses
+	 * the plain (legacy) MAP header, and reporting MAPv4 would make the
+	 * modem stack build an rmnet link that does not match the modem's
+	 * data format.
+	 */
+	name = rx ? IPA_ENDPOINT_AP_MODEM_RX : IPA_ENDPOINT_AP_MODEM_TX;
+	endpoint = ipa->name_map[name];
+
+	if (!endpoint ||
+	    (ipa->version <= IPA_VERSION_2_6L && !endpoint->config.checksum))
+		return "MAP";
+
 	return ipa->version < IPA_VERSION_4_5 ? "MAPv4" : "MAPv5";
 }
 
@@ -81,7 +99,7 @@ static ssize_t rx_offload_show(struct device *dev,
 {
 	struct ipa *ipa = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "%s\n", ipa_offload_string(ipa));
+	return sysfs_emit(buf, "%s\n", ipa_offload_string(ipa, true));
 }
 
 static DEVICE_ATTR_RO(rx_offload);
@@ -91,7 +109,7 @@ static ssize_t tx_offload_show(struct device *dev,
 {
 	struct ipa *ipa = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "%s\n", ipa_offload_string(ipa));
+	return sysfs_emit(buf, "%s\n", ipa_offload_string(ipa, false));
 }
 
 static DEVICE_ATTR_RO(tx_offload);

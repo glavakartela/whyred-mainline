@@ -69,6 +69,8 @@ struct ipa_smp2p;
  * @setup_complete:	Flag indicating whether setup stage has completed
  * @modem_state:	State of modem (stopped, running)
  * @modem_netdev:	Network device structure used for modem
+ * @data_format:	Modem data-port mapping state
+ * @qmap_mux_id:	QMAP mux ID used for the modem data path
  * @qmi:		QMI information
  */
 struct ipa {
@@ -83,34 +85,40 @@ struct ipa {
 
 	dma_addr_t table_addr;
 	void *table_virt;
-	u32 route_count;
-	u32 modem_route_count;
-	u32 filter_count;
-
-	/* IPA v2.x filter and route tables kept in system memory */
+	/* Separate filter/route table content used on IPA v2.x */
 	dma_addr_t filter_table_addr;
 	void *filter_table_virt;
 	size_t filter_table_size;
 	dma_addr_t filter_table_addr_v6;
 	void *filter_table_virt_v6;
 	size_t filter_table_size_v6;
-
+	dma_addr_t ap_filter_rule_addr;
+	void *ap_filter_rule_virt;
+	/* Rule sets installed for the AP's uplink pipe, indexed by IP version */
+	void *modem_flt_rule_virt[2];
+	dma_addr_t modem_flt_rule_addr[2];
+	size_t modem_flt_rule_size[2];
+	/* Match-all rule set for the modem's TX (downlink to AP) pipe */
+	void *dl_flt_rule_virt;
+	dma_addr_t dl_flt_rule_addr;
+	size_t dl_flt_rule_size;
+	dma_addr_t pipe_5_route_rule_addr;
+	void *pipe_5_route_rule_virt;
+	/* System header table and processing context for the QMAP mux */
+	void *hdr_table_virt;
+	dma_addr_t hdr_table_addr;
+	size_t hdr_table_size;
+	void *proc_ctx_virt;
+	dma_addr_t proc_ctx_addr;
+	size_t proc_ctx_size;
 	dma_addr_t route_table_addr;
 	void *route_table_virt;
 	size_t route_table_size;
-
-	dma_addr_t ap_filter_rule_addr;
-	void *ap_filter_rule_virt;
-
 	dma_addr_t ap_route_rule_addr;
 	void *ap_route_rule_virt;
-
-	dma_addr_t dl_flt_rule_addr;
-	void *dl_flt_rule_virt;
-	size_t dl_flt_rule_size;
-
-	dma_addr_t pipe_5_route_rule_addr;
-	void *pipe_5_route_rule_virt;
+	u32 route_count;
+	u32 modem_route_count;
+	u32 filter_count;
 
 	struct ipa_interrupt *interrupt;
 	bool uc_powered;
@@ -163,6 +171,7 @@ struct ipa {
 	atomic_t modem_state;		/* enum ipa_modem_state */
 	struct net_device *modem_netdev;
 	struct ipa_data_format *data_format;
+	u32 qmap_mux_id;
 	struct ipa_qmi qmi;
 };
 

@@ -152,9 +152,9 @@ union ipa_cmd_hw_dma_mem_mem {
 };
 
 #define CMD_FIELD(_version, _payload, _field)			\
-	*(((_version) > IPA_VERSION_2_6L) ?			\
-	  &(_payload->v3._field) :				\
-	  &(_payload->v2._field))
+	(*(((_version) > IPA_VERSION_2_6L) ?			\
+	   &(_payload)->v3._field :				\
+	   &(_payload)->v2._field))
 
 #define SET_DMA_FIELD(_ver, _payload, _field, _value)		\
 	do {							\
@@ -179,8 +179,8 @@ struct ipa_cmd_ip_packet_tag_status {
 	__le64 tag;
 };
 
-#define IPA_V2_IP_PACKET_TAG_STATUS_TAG_FMASK		GENMASK_ULL(63, 32)
-#define IPA_V3_IP_PACKET_TAG_STATUS_TAG_FMASK		GENMASK_ULL(63, 16)
+#define IPA_IP_PACKET_TAG_FMASK_V2			GENMASK_ULL(63, 32)
+#define IPA_IP_PACKET_TAG_FMASK_V3			GENMASK_ULL(63, 16)
 
 /* Immediate command payload */
 union ipa_cmd_payload {
@@ -495,6 +495,9 @@ void ipa_cmd_hdr_init_system_add(struct ipa_trans *trans, dma_addr_t addr)
 	union ipa_cmd_payload *cmd_payload;
 	dma_addr_t payload_addr;
 
+	if (ipa->version > IPA_VERSION_2_6L)
+		return;
+
 	cmd_payload = ipa_cmd_payload_alloc(ipa, &payload_addr);
 	payload = &cmd_payload->hdr_init_system;
 
@@ -540,14 +543,14 @@ void ipa_cmd_register_write_add(struct ipa_trans *trans, u32 offset, u32 value,
 
 		/* Extract the top 4 bits and encode it into the flags field */
 		flags = u16_encode_bits(offset_high,
-				REGISTER_WRITE_FLAGS_OFFSET_HIGH_FMASK);
+					REGISTER_WRITE_FLAGS_OFFSET_HIGH_FMASK);
 		options = 0;	/* reserved */
 
 	} else {
 		flags = 0;	/* SKIP_CLEAR flag is always 0 */
 		if (ipa->version > IPA_VERSION_2_6L)
 			options = u16_encode_bits(clear_option,
-					REGISTER_WRITE_CLEAR_OPTIONS_FMASK);
+						  REGISTER_WRITE_CLEAR_OPTIONS_FMASK);
 		else
 			options = 0;
 	}
@@ -644,7 +647,13 @@ static void ipa_cmd_ip_tag_status_add(struct ipa_trans *trans)
 	cmd_payload = ipa_cmd_payload_alloc(ipa, &payload_addr);
 	payload = &cmd_payload->ip_packet_tag_status;
 
-	payload->tag = 0;
+	/* The mask passed to le64_encode_bits() must be a compile-time
+	 * constant, so select it in each branch rather than in a variable.
+	 */
+	if (trans->dma_subsys->version <= IPA_VERSION_2_6L)
+		payload->tag = le64_encode_bits(0, IPA_IP_PACKET_TAG_FMASK_V2);
+	else
+		payload->tag = le64_encode_bits(0, IPA_IP_PACKET_TAG_FMASK_V3);
 
 	ipa_trans_cmd_add(trans, payload, sizeof(*payload), payload_addr,
 			  opcode);
@@ -699,7 +708,10 @@ u32 ipa_cmd_pipeline_clear_count(void)
 
 void ipa_cmd_pipeline_clear_wait(struct ipa *ipa)
 {
-	wait_for_completion(&ipa->completion);
+	unsigned long timeout = msecs_to_jiffies(1000);
+
+	if (!wait_for_completion_timeout(&ipa->completion, timeout))
+		dev_err(ipa->dev, "%s timed out\n", __func__);
 }
 
 /* Allocate a transaction for the command TX endpoint */

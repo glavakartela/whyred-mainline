@@ -247,8 +247,8 @@ static int ipa_data_format_dpm(struct ipa_data_format *df)
 		return 0;
 	}
 
-	dev_info(ipa->dev, "DPM port mapping installed (tx %u rx %u)\n",
-		 req.info.tx_endpoint, req.info.rx_endpoint);
+	dev_dbg(ipa->dev, "DPM port mapping installed (tx %u rx %u)\n",
+		req.info.tx_endpoint, req.info.rx_endpoint);
 
 	return 0;
 }

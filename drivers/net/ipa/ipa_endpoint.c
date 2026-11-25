@@ -84,11 +84,15 @@ enum ipa_status_mask {
 	IPA_STATUS_MASK_BYTE_LIMIT		= BIT(15),
 };
 
+/* Cookie stored in the status tag_f_2 field by the IPA tag process
+ * (IPA_IP_PACKET_TAG_STATUS command).  The tag process is used to
+ * flush/synchronize the IPA pipeline, and its status packets carry
+ * this cookie in the 48-bit tag.
+ */
+#define IPA_COOKIE				0x57831603
+
 /* Special IPA filter/router rule field value indicating "rule miss" */
 #define IPA_STATUS_RULE_MISS	0x3ff	/* 10-bit filter/router rule fields */
-
-/* Tag written by the IPA tag process for pipeline synchronization */
-#define IPA_COOKIE		0x57831603
 
 /** The IPA status nat_type field uses enum ipa_nat_type hardware values */
 
@@ -654,8 +658,10 @@ int ipa_endpoint_modem_exception_reset_all(struct ipa *ipa)
 	/* On IPA v2.x, the endpoint status register's low-order bit forces
 	 * aggregation closed rather than enabling status.
 	 */
-	if (ipa->version <= IPA_VERSION_2_6L)
-		value = value_mask = 1;
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		value = 1;
+		value_mask = 1;
+	}
 
 	for_each_set_bit(endpoint_id, ipa->defined, ipa->endpoint_count) {
 		struct ipa_endpoint *endpoint;
@@ -961,7 +967,15 @@ static void ipa_endpoint_init_mode(struct ipa_endpoint *endpoint)
 		val = reg_encode(reg, ENDP_MODE, IPA_DMA);
 		val |= reg_encode(reg, DEST_PIPE_INDEX, dma_endpoint_id);
 	} else {
+		/* In BASIC mode DEST_PIPE_INDEX is the fallback destination
+		 * used when no filter or routing rule matches.  Stock routes
+		 * these to the AP LAN consumer (endpoint 2); see ipa2-lite's
+		 * REG_IPA_EP_MODE and downstream ipa2_cfg_ep_mode().
+		 */
+		u32 lan_rx_id = ipa->name_map[IPA_ENDPOINT_AP_LAN_RX]->endpoint_id;
+
 		val = reg_encode(reg, ENDP_MODE, IPA_BASIC);
+		val |= reg_encode(reg, DEST_PIPE_INDEX, lan_rx_id);
 	}
 	/* All other bits unspecified (and 0) */
 
@@ -1569,18 +1583,21 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 		tag_low32 = ipa_status_extract(ipa, data, STATUS_TAG_LOW32);
 		tag_high16 = ipa_status_extract(ipa, data, STATUS_TAG_HIGH16);
 
-		/* A cookie-tagged status is a pipeline flush/synchronization
-		 * marker, not data: consume it without reporting an error.
+		/* The IPA tag process (IPA_IP_PACKET_TAG_STATUS) stores
+		 * IPA_COOKIE in tag_f_2, the high 32 bits of the 48-bit
+		 * tag.  Such a status is a pipeline flush/synchronization
+		 * marker, not an unexpected packet: consume it without
+		 * treating it as an error.
 		 */
 		if (tag_high16 == (IPA_COOKIE >> 16) &&
 		    (tag_low32 >> 16) == (IPA_COOKIE & 0xffff)) {
 			dev_dbg(ipa->dev,
 				"IPA tag process status from endpoint %u\n",
 				endpoint_id);
-			return true;
+			return true;	/* pipeline sync marker, drop it */
 		}
 
-		/* IPA v2.6L tags ordinary WAN downlink data with a
+		/* IPA v2.6L firmware tags ordinary WAN downlink data with a
 		 * non-cookie tag.  Dropping those packets leaves the modem
 		 * netdev with RX == 0 even though the downlink arrives.
 		 */
@@ -1614,7 +1631,6 @@ ipa_endpoint_status_drop(struct ipa_endpoint *endpoint, const void *data)
 		return exception == IPA_STATUS_EXCEPTION_DEAGGR;
 
 	/* Drop the packet if it fails to match a routing rule; otherwise no */
-	/* IPA v2.x uses an 8-bit rule field and reports a miss as 0xff */
 	rule = ipa_status_extract(ipa, data, STATUS_ROUTER_RULE_INDEX);
 	if (rule == (ipa->version <= IPA_VERSION_2_6L ? 0xff :
 		     IPA_STATUS_RULE_MISS))
@@ -1639,9 +1655,13 @@ static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
 		u32 len;
 
 		if (resid < IPA_STATUS_SIZE) {
-			dev_err(dev,
-				"short message (%u bytes < %zu byte status)\n",
-				resid, IPA_STATUS_SIZE);
+			if (ipa->version <= IPA_VERSION_2_6L)
+				dev_dbg(dev, "short RX status transaction (%u bytes)\n",
+					resid);
+			else
+				dev_err(dev,
+					"short message (%u bytes < %zu byte status)\n",
+					resid, IPA_STATUS_SIZE);
 			break;
 		}
 
@@ -1753,8 +1773,15 @@ void ipa_endpoint_default_route_set(struct ipa *ipa, u32 endpoint_id)
 	val = reg_encode(reg, ROUTE_DEF_PIPE, endpoint_id);
 	val |= reg_bit(reg, ROUTE_DEF_HDR_TABLE);
 	/* ROUTE_DEF_HDR_OFST is 0 */
-	val |= reg_encode(reg, ROUTE_FRAG_DEF_PIPE, endpoint_id);
-	val |= reg_bit(reg, ROUTE_DEF_RETAIN_HDR);
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		/* Stock v2.5/2.6L: fragments go to the AP's modem TX pipe
+		 * (4) and the default route does not retain the header.
+		 */
+		val |= reg_encode(reg, ROUTE_FRAG_DEF_PIPE, 4);
+	} else {
+		val |= reg_encode(reg, ROUTE_FRAG_DEF_PIPE, endpoint_id);
+		val |= reg_bit(reg, ROUTE_DEF_RETAIN_HDR);
+	}
 
 	iowrite32(val, ipa->reg_virt + reg_offset(reg));
 }
@@ -1869,9 +1896,13 @@ static void ipa_endpoint_reset(struct ipa_endpoint *endpoint)
 
 	/* On IPA v3.5.1, if an RX endpoint is reset while aggregation
 	 * is active, we need to handle things specially to recover.
-	 * All other cases just need to reset the underlying GSI channel.
+	 * All other cases just need to reset the underlying channel.
+	 * The special sequence reads a byte through a GSI TRE, so it
+	 * only applies to GSI-based hardware; BAM (IPA v2.x) just gets
+	 * its pipe reset.
 	 */
-	special = ipa->version < IPA_VERSION_4_0 && !endpoint->toward_ipa &&
+	special = IPA_HAS_GSI(ipa->version) &&
+			ipa->version < IPA_VERSION_4_0 && !endpoint->toward_ipa &&
 			endpoint->config.aggregation;
 	if (special && ipa_endpoint_aggr_active(endpoint))
 		ret = ipa_endpoint_reset_rx_aggr(endpoint);
@@ -2252,13 +2283,18 @@ int ipa_endpoint_init(struct ipa *ipa, u32 count,
 {
 	enum ipa_endpoint_name name;
 	u32 filtered;
+	u32 max;
 
 	BUILD_BUG_ON(!IPA_REPLENISH_BATCH);
 
-	/* Number of endpoints is one more than the maximum ID */
-	ipa->endpoint_count = ipa_endpoint_max(ipa, count, data) + 1;
-	if (!ipa->endpoint_count)
+	/* Number of endpoints is one more than the maximum ID.  A zero
+	 * maximum means the configuration was rejected; fail loudly rather
+	 * than silently running with endpoint_count == 1.
+	 */
+	max = ipa_endpoint_max(ipa, count, data);
+	if (!max)
 		return -EINVAL;
+	ipa->endpoint_count = max + 1;
 
 	/* Initialize endpoint state bitmaps */
 	ipa->defined = bitmap_zalloc(ipa->endpoint_count, GFP_KERNEL);

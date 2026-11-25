@@ -71,6 +71,12 @@ static int ipa_open(struct net_device *netdev)
 
 	netif_start_queue(netdev);
 
+	/* The stock AP installs the WAN downlink filters when the interface
+	 * comes up; do the same so a modem call-setup filter reset cannot
+	 * leave the modem without them.
+	 */
+	ipa_qmi_wan_filters_install(ipa);
+
 	(void)pm_runtime_put_autosuspend(dev);
 
 	return 0;

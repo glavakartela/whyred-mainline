@@ -243,8 +243,10 @@ static const struct ipa_mem_data ipa_mem_data_v2_5 = {
 /* Configuration data for an SoC having IPA v2.5 */
 const struct ipa_data ipa_data_v2_5 = {
 	.version		= IPA_VERSION_2_5,
-	/* The hardware route table has 15 entries; the modem owns
-	 * indices 0..6 and the AP uses 7..14.
+	/* The vendor v2 stack applies this BCR value for all versions >= v2.5 */
+	.backward_compat	= 0x1fff7f,
+	/* The modem owns route entries 0..6, the AP owns 7..14.  This is
+	 * IPA_MEM_v2_5_V4_MODEM_RT_INDEX_HI / V4_APPS_RT_INDEX_LO.
 	 */
 	.modem_route_count	= 7,
 	.endpoint_count		= ARRAY_SIZE(ipa_gsi_endpoint_data),
@@ -329,8 +331,8 @@ const struct ipa_data ipa_data_v2_6L = {
 	.version		= IPA_VERSION_2_6L,
 	/* Unfortunately we don't know what this BCR value corresponds to */
 	.backward_compat	= 0x1fff7f,
-	/* The hardware route table has 15 entries; the modem owns
-	 * indices 0..6 and the AP uses 7..14.
+	/* The modem owns route entries 0..6, the AP owns 7..14.  This is
+	 * IPA_MEM_v2_6L_V4_MODEM_RT_INDEX_HI / V4_APPS_RT_INDEX_LO.
 	 */
 	.modem_route_count	= 7,
 	.endpoint_count		= ARRAY_SIZE(ipa_gsi_endpoint_data),

@@ -4,7 +4,9 @@
  * Copyright (C) 2018-2024 Linaro Ltd.
  */
 
+#include <linux/module.h>
 #include <linux/qrtr.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
 
@@ -13,6 +15,18 @@
 #include "ipa_mem.h"
 #include "ipa_modem.h"
 #include "ipa_qmi_msg.h"
+#include "ipa_table.h"
+
+/* On IPA v2.6L the modem installs its own WAN downlink filters; an AP-side
+ * INSTALL_FILTER_RULE request for the WAN DL path conflicts with the modem
+ * and leaves DL at 0 pps (see vendor port POSTMARKETOS_X00TD_CELLULAR.md:
+ * "qcom,modem-cfg-emb-pipe-flt ... DL stays at 0 pps").  Default OFF; set
+ * wan_dl_filter=1 to restore the old wip2 behaviour for A/B testing.
+ */
+static bool wan_dl_filter;
+module_param(wan_dl_filter, bool, 0644);
+MODULE_PARM_DESC(wan_dl_filter,
+		 "install AP-side WAN DL filters on modem (default N; v2.6L modem owns them)");
 
 /**
  * DOC: AP/Modem QMI Handshake
@@ -149,7 +163,7 @@ static void ipa_qmi_ready(struct ipa_qmi *ipa_qmi)
 		return;
 	}
 
-	/* Now that the modem's IPA is ready, map its data port */
+	/* Now that the modem's IPA is ready, negotiate its data format */
 	ipa_data_format_start(ipa);
 }
 
@@ -163,7 +177,7 @@ static void ipa_server_bye(struct qmi_handle *qmi, unsigned int node)
 	/* The modem client and server go away at the same time */
 	memset(&ipa_qmi->modem_sq, 0, sizeof(ipa_qmi->modem_sq));
 
-	/* The negotiated data-port mapping went away with the modem */
+	/* The negotiated data format went away with the modem */
 	ipa_data_format_stop(container_of(ipa_qmi, struct ipa, qmi));
 
 	/* initial_boot doesn't change when modem reboots */
@@ -238,7 +252,306 @@ static void ipa_server_driver_init_complete(struct qmi_handle *qmi,
 	}
 }
 
-/* The server handles two request message types sent by the modem. */
+/* Generic success response for requests we acknowledge but do not parse */
+struct ipa_generic_rsp {
+	struct qmi_response_type_v01 rsp;
+};
+
+static const struct qmi_elem_info ipa_generic_rsp_ei[] = {
+	{
+		.data_type	= QMI_STRUCT,
+		.elem_len	= 1,
+		.elem_size	= sizeof(struct qmi_response_type_v01),
+		.tlv_type	= 0x02,
+		.offset		= 0,
+		.ei_array	= qmi_response_type_v01_ei,
+	},
+	{ }
+};
+
+/* Element info that decodes no TLVs; the handler just acknowledges */
+static const struct qmi_elem_info ipa_ignore_ei[] = {
+	{ .data_type = QMI_EOTI },
+};
+
+static void ipa_server_ack(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
+			   struct qmi_txn *txn, u16 msg_id)
+{
+	struct ipa_qmi *ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
+	struct ipa *ipa = container_of(ipa_qmi, struct ipa, qmi);
+	struct ipa_generic_rsp rsp = { };
+	int ret;
+
+	rsp.rsp.result = QMI_RESULT_SUCCESS_V01;
+	rsp.rsp.error = QMI_ERR_NONE_V01;
+
+	ret = qmi_send_response(qmi, sq, txn, msg_id, 64,
+				ipa_generic_rsp_ei, &rsp);
+	if (ret)
+		dev_err(ipa->dev, "error %d sending QMI 0x%02x response\n",
+			ret, msg_id);
+}
+
+/* Tell the modem which pipe the rules were installed on, as downstream
+ * does after handling the Q6 UL filter request.
+ */
+static void ipa_server_filter_notif(struct ipa *ipa, u32 source_pipe,
+				    const struct ipa_install_fltr_rule_req *req)
+{
+	struct ipa_qmi *ipa_qmi = &ipa->qmi;
+	struct ipa_fltr_installed_notif_req notif = { };
+	struct qmi_response_type_v01 rsp;
+	struct qmi_txn txn;
+	u32 count;
+	u32 i;
+	int ret;
+
+	if (!req->filter_spec_list_valid)
+		return;
+
+	count = min_t(u32, req->filter_spec_list_len, IPA_QMI_MAX_FILTERS);
+	notif.source_pipe_index = source_pipe;
+	notif.install_status = QMI_RESULT_SUCCESS_V01;
+	notif.filter_index_list_len = count;
+	for (i = 0; i < count; i++) {
+		notif.filter_index_list[i].filter_handle = i + 1;
+		notif.filter_index_list[i].filter_index = i;
+	}
+
+	ret = qmi_txn_init(&ipa_qmi->client_handle, &txn,
+			   ipa_fltr_installed_notif_rsp_ei, &rsp);
+	if (ret < 0) {
+		dev_warn(ipa->dev, "no QMI transaction for filter notif\n");
+		return;
+	}
+	ret = qmi_send_request(&ipa_qmi->client_handle, &ipa_qmi->modem_sq,
+			       &txn, IPA_QMI_FILTER_INSTALLED_NOTIF,
+			       sizeof(notif),
+			       ipa_fltr_installed_notif_req_ei, &notif);
+	if (ret) {
+		qmi_txn_cancel(&txn);
+		dev_warn(ipa->dev, "error %d sending filter notification\n",
+			 ret);
+		return;
+	}
+	/* On success qmi_txn_wait() returns the number of decoded bytes */
+	ret = qmi_txn_wait(&txn, msecs_to_jiffies(1000));
+	if (ret < 0)
+		dev_warn(ipa->dev, "filter notification not acknowledged: %d\n",
+			 ret);
+}
+
+/* Fill in one filter spec for the stock WAN downlink default rule set.
+ * Both rules match on the IPv4 destination address, which the hardware
+ * encodes as an offset_meq_32 equation at byte offset 16.
+ */
+static void ipa_qmi_wan_dl_filter_init(struct ipa_filter_spec *spec, u32 id,
+				       u32 mask, u32 value, u32 mux_id)
+{
+	struct ipa_filter_rule *rule = &spec->filter_rule;
+
+	spec->filter_spec_identifier = id;
+	spec->ip_type = IPA_QMI_REQ_IP_TYPE_V4;
+	spec->filter_action = IPA_QMI_REQ_FILTER_ACTION_ROUTE;
+	spec->is_routing_table_index_valid = 1;
+	spec->route_table_index = IPA_QMI_WAN_DL_ROUTE_TABLE;
+	spec->is_mux_id_valid = 1;
+	spec->mux_id = mux_id;
+
+	rule->rule_eq_bitmap = BIT(2);		/* offset_meq_32_0 */
+	rule->num_offset_meq_32 = 1;
+	rule->offset_meq_32[0].offset = 16;	/* IPv4 destination address */
+	rule->offset_meq_32[0].mask = mask;
+	rule->offset_meq_32[0].value = value;
+}
+
+/* Send the WAN downlink filters the stock AP installs on the modem.
+ * ipacm sends these over QMI after its local route and header setup; do
+ * the same once the modem's uplink filter request has been handled.
+ */
+static void ipa_qmi_install_wan_filters(struct ipa *ipa)
+{
+	struct ipa_qmi *ipa_qmi = &ipa->qmi;
+	struct ipa_install_fltr_rule_req *req;
+	struct ipa_install_fltr_rule_rsp rsp = { };
+	struct qmi_txn txn;
+	u32 mux_id;
+	int ret;
+
+	if (ipa->version > IPA_VERSION_2_6L)
+		return;
+
+	req = kzalloc_obj(*req);
+	if (!req)
+		return;
+
+	/* The rmnet link's mux ID must match the one the userspace bearer
+	 * setup uses (ModemManager uses 0 by default; vendor-init-style
+	 * tools may use 1).
+	 */
+	mux_id = ipa->qmap_mux_id;
+
+	req->filter_spec_list_valid = 1;
+	req->filter_spec_list_len = IPA_QMI_WAN_DL_FILTER_COUNT;
+
+	/* ipacm walks the table backwards: broadcast first, then the
+	 * multicast prefix.
+	 */
+	ipa_qmi_wan_dl_filter_init(&req->filter_spec_list[0], 0,
+				   0xffffffff, 0xffffffff, mux_id);
+	ipa_qmi_wan_dl_filter_init(&req->filter_spec_list[1], 1,
+				   0xf0000000, 0xe0000000, mux_id);
+
+	ret = qmi_txn_init(&ipa_qmi->client_handle, &txn,
+			   ipa_install_fltr_rule_rsp_ei, &rsp);
+	if (ret < 0) {
+		dev_warn(ipa->dev,
+			 "no QMI transaction for WAN filter install\n");
+		goto out_free;
+	}
+
+	ret = qmi_send_request(&ipa_qmi->client_handle, &ipa_qmi->modem_sq,
+			       &txn, IPA_QMI_INSTALL_FILTER_RULE,
+			       IPA_QMI_INSTALL_FILTER_RULE_REQ_SZ,
+			       ipa_install_fltr_rule_req_ei, req);
+	if (ret) {
+		qmi_txn_cancel(&txn);
+		dev_warn(ipa->dev,
+			 "error %d sending WAN filter install request\n", ret);
+		goto out_free;
+	}
+
+	/* On success qmi_txn_wait() returns the number of decoded bytes */
+	ret = qmi_txn_wait(&txn, msecs_to_jiffies(1000));
+	if (ret < 0) {
+		dev_warn(ipa->dev,
+			 "WAN filter install not acknowledged: %d\n", ret);
+		goto out_free;
+	}
+
+	if (rsp.rsp.result != QMI_RESULT_SUCCESS_V01) {
+		dev_warn(ipa->dev,
+			 "modem rejected WAN filters: result %u error %u\n",
+			 rsp.rsp.result, rsp.rsp.error);
+		goto out_free;
+	}
+
+	dev_dbg(ipa->dev,
+		"installed WAN DL filters on modem (mux %u, rt %u, %u handles)\n",
+		 mux_id, IPA_QMI_WAN_DL_ROUTE_TABLE,
+		 rsp.filter_handle_list_valid ? rsp.filter_handle_list_len : 0);
+
+out_free:
+	kfree(req);
+}
+
+/* Re-install the WAN downlink filters on the modem.  The stock AP does this
+ * when the WAN interface comes up (ipacm install_wan_filtering_rule), i.e.
+ * after the data call exists; installing only at modem boot can be undone
+ * by the modem's call setup.
+ */
+void ipa_qmi_wan_filters_install(struct ipa *ipa)
+{
+	if (wan_dl_filter)
+		ipa_qmi_install_wan_filters(ipa);
+}
+
+static void ipa_server_install_filter_rule(struct qmi_handle *qmi,
+					   struct sockaddr_qrtr *sq,
+					   struct qmi_txn *txn,
+					   const void *decoded)
+{
+	struct ipa_qmi *ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
+	struct ipa *ipa = container_of(ipa_qmi, struct ipa, qmi);
+	const struct ipa_install_fltr_rule_req *req = decoded;
+	struct ipa_install_fltr_rule_rsp rsp = { };
+	u32 count;
+	u32 i;
+	int ret;
+
+	if (ipa->version > IPA_VERSION_2_6L)
+		return;
+
+	dev_dbg(ipa->dev,
+		"received install filter rule request (%u specs)\n",
+		req->filter_spec_list_valid ? req->filter_spec_list_len : 0);
+
+	ret = ipa_table_install_filter_rules(ipa, req);
+	if (ret)
+		dev_err(ipa->dev, "error %d installing filter rules\n", ret);
+
+	rsp.rsp.result = QMI_RESULT_SUCCESS_V01;
+	rsp.rsp.error = QMI_ERR_NONE_V01;
+
+	count = req->filter_spec_list_valid ? req->filter_spec_list_len : 0;
+	count = min_t(u32, count, IPA_QMI_MAX_FILTERS);
+	if (count) {
+		rsp.filter_handle_list_valid = 1;
+		rsp.filter_handle_list_len = count;
+		for (i = 0; i < count; i++) {
+			rsp.filter_handle_list[i].filter_spec_identifier =
+				req->filter_spec_list[i].filter_spec_identifier;
+			/* Handles are only meaningful to this driver */
+			rsp.filter_handle_list[i].filter_handle = i + 1;
+		}
+	}
+
+	ret = qmi_send_response(qmi, sq, txn, IPA_QMI_INSTALL_FILTER_RULE,
+				sizeof(struct ipa_install_fltr_rule_rsp),
+				ipa_install_fltr_rule_rsp_ei, &rsp);
+	if (ret) {
+		dev_err(ipa->dev,
+			"error %d sending filter rule response\n", ret);
+		return;
+	}
+
+	/* Now tell the modem the rules are in place.  This is a separate
+	 * request in the other direction and must follow the response.
+	 */
+	if (ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX]) {
+		u32 pipe;
+
+		pipe = ipa->name_map[IPA_ENDPOINT_AP_MODEM_TX]->endpoint_id;
+		ipa_server_filter_notif(ipa, pipe, req);
+	}
+
+	/* On IPA v2.6L the modem owns the WAN DL filters; installing them from
+	 * the AP here conflicts with the modem and leaves DL at 0 pps.  Opt in
+	 * with wan_dl_filter=1 only for A/B testing.
+	 */
+	if (wan_dl_filter)
+		ipa_qmi_install_wan_filters(ipa);
+}
+
+static void ipa_server_filter_installed(struct qmi_handle *qmi,
+					struct sockaddr_qrtr *sq,
+					struct qmi_txn *txn,
+					const void *decoded)
+{
+	struct ipa_qmi *ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
+	struct ipa *ipa = container_of(ipa_qmi, struct ipa, qmi);
+
+	if (ipa->version > IPA_VERSION_2_6L)
+		return;
+
+	dev_dbg(ipa->dev, "received filter installed notification\n");
+	ipa_server_ack(qmi, sq, txn, IPA_QMI_FILTER_INSTALLED_NOTIF);
+}
+
+static void ipa_server_config(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
+			      struct qmi_txn *txn, const void *decoded)
+{
+	struct ipa_qmi *ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
+	struct ipa *ipa = container_of(ipa_qmi, struct ipa, qmi);
+
+	if (ipa->version > IPA_VERSION_2_6L)
+		return;
+
+	dev_dbg(ipa->dev, "received IPA config request\n");
+	ipa_server_ack(qmi, sq, txn, IPA_QMI_CONFIG);
+}
+
+/* The server handles request message types sent by the modem. */
 static const struct qmi_msg_handler ipa_server_msg_handlers[] = {
 	{
 		.type		= QMI_REQUEST,
@@ -253,6 +566,27 @@ static const struct qmi_msg_handler ipa_server_msg_handlers[] = {
 		.ei		= ipa_driver_init_complete_req_ei,
 		.decoded_size	= IPA_QMI_DRIVER_INIT_COMPLETE_REQ_SZ,
 		.fn		= ipa_server_driver_init_complete,
+	},
+	{
+		.type		= QMI_REQUEST,
+		.msg_id		= IPA_QMI_INSTALL_FILTER_RULE,
+		.ei		= ipa_install_fltr_rule_req_ei,
+		.decoded_size	= sizeof(struct ipa_install_fltr_rule_req),
+		.fn		= ipa_server_install_filter_rule,
+	},
+	{
+		.type		= QMI_REQUEST,
+		.msg_id		= IPA_QMI_FILTER_INSTALLED_NOTIF,
+		.ei		= ipa_fltr_installed_notif_req_ei,
+		.decoded_size	= sizeof(struct ipa_fltr_installed_notif_req),
+		.fn		= ipa_server_filter_installed,
+	},
+	{
+		.type		= QMI_REQUEST,
+		.msg_id		= IPA_QMI_CONFIG,
+		.ei		= ipa_ignore_ei,
+		.decoded_size	= 1,
+		.fn		= ipa_server_config,
 	},
 	{ },
 };
@@ -490,9 +824,22 @@ static const struct qmi_ops ipa_client_ops = {
 int ipa_qmi_setup(struct ipa *ipa)
 {
 	struct ipa_qmi *ipa_qmi = &ipa->qmi;
+	size_t max_recv = IPA_QMI_SERVER_MAX_RCV_SZ;
+	size_t max_client_recv = IPA_QMI_CLIENT_MAX_RCV_SZ;
 	int ret;
 
 	ipa_qmi->initial_boot = true;
+
+	/* IPA v2.x modems send filter-rule and configuration requests over
+	 * the IPA QMI service; those messages are far larger than the
+	 * initialization messages the server handle was sized for.  The
+	 * client handle also has to receive the modem's responses to the
+	 * filter-rule requests sent in this direction.
+	 */
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		max_recv = IPA_QMI_V2_SERVER_MAX_RCV_SZ;
+		max_client_recv = IPA_QMI_V2_CLIENT_MAX_RCV_SZ;
+	}
 
 	/* The server handle is used to handle the DRIVER_INIT_COMPLETE
 	 * request on the first modem boot.  It also receives the
@@ -501,7 +848,7 @@ int ipa_qmi_setup(struct ipa *ipa)
 	 * sent over the server handle if requested.
 	 */
 	ret = qmi_handle_init(&ipa_qmi->server_handle,
-			      IPA_QMI_SERVER_MAX_RCV_SZ, &ipa_server_ops,
+			      max_recv, &ipa_server_ops,
 			      ipa_server_msg_handlers);
 	if (ret)
 		return ret;
@@ -511,11 +858,11 @@ int ipa_qmi_setup(struct ipa *ipa)
 	if (ret)
 		goto err_server_handle_release;
 
-	/* The client handle is only used for sending an INIT_DRIVER request
-	 * to the modem, and receiving its response message.
+	/* The client handle sends INIT_DRIVER and filter-rule requests to
+	 * the modem, and receives their response messages.
 	 */
 	ret = qmi_handle_init(&ipa_qmi->client_handle,
-			      IPA_QMI_CLIENT_MAX_RCV_SZ, &ipa_client_ops,
+			      max_client_recv, &ipa_client_ops,
 			      ipa_client_msg_handlers);
 	if (ret)
 		goto err_server_handle_release;
@@ -528,13 +875,14 @@ int ipa_qmi_setup(struct ipa *ipa)
 	if (ret)
 		goto err_client_handle_release;
 
-	/* Data-port mapping is optional; the modem path still works
+	/* Data-format negotiation is optional; the modem path still works
 	 * without it, just with the modem's default framing.
 	 */
 	ret = ipa_data_format_setup(ipa);
 	if (ret)
 		dev_warn(ipa->dev,
-			 "unable to set up data-port mapping: %d\n", ret);
+			 "unable to set up data-format negotiation: %d\n",
+			 ret);
 
 	return 0;
 
@@ -572,7 +920,7 @@ void ipa_qmi_teardown(struct ipa *ipa)
 	cancel_work_sync(&ipa->qmi.init_driver_work);
 
 	/* Stop the server handle first: its "bye" callback can reach the
-	 * data-port state, which is freed below.
+	 * data-format state, which is freed below.
 	 */
 	qmi_handle_release(&ipa->qmi.server_handle);
 	memset(&ipa->qmi.server_handle, 0, sizeof(ipa->qmi.server_handle));
