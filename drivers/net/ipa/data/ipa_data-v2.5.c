@@ -49,6 +49,7 @@ static const struct ipa_gsi_endpoint_data ipa_gsi_endpoint_data[] = {
 				.rx = {
 					.buffer_size	= 8192,
 					.pad_align	= ilog2(sizeof(u32)),
+					.aggr_time_limit = 500,
 				},
 			},
 		},
@@ -66,6 +67,11 @@ static const struct ipa_gsi_endpoint_data ipa_gsi_endpoint_data[] = {
 		},
 		.endpoint	= {
 			.config	= {
+				/* Plain QMAP uplink: only the 4-byte MAP
+				 * header, no checksum offload.  QMAPv3
+				 * uplink is not validated on this hardware.
+				 */
+				.checksum	= false,
 				.qmap		= true,
 				.status_enable	= true,
 				.tx = {
@@ -88,10 +94,25 @@ static const struct ipa_gsi_endpoint_data ipa_gsi_endpoint_data[] = {
 		},
 		.endpoint	= {
 			.config = {
-				.aggregation	= true,
+				/* Plain QMAP downlink: no checksum trailer, so
+				 * checksum offload stays off.  rmnet
+				 * deaggregates the QMAP frames it receives.
+				 */
+				.checksum	= false,
 				.qmap		= true,
+				.aggregation	= false,
+				/* Parse the packet statuses the IPA prepends
+				 * on this endpoint.  This is also what lets
+				 * the tag-process status packets (IPA_COOKIE)
+				 * be recognized instead of being delivered as
+				 * 4-byte data frames.
+				 */
+				.status_enable	= true,
 				.rx = {
-					.buffer_size	= 8192,
+					/* Large enough for the modem's maximum
+					 * aggregate (63 * 512 bytes).
+					 */
+					.buffer_size	= 32768,
 				},
 			},
 		},

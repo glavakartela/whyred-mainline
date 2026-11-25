@@ -159,37 +159,61 @@ static u32 ipa_status_extract(struct ipa *ipa, const void *data,
 	case STATUS_FILTER_LOCAL:
 		return le32_get_bits(word[3], GENMASK(0, 0));
 	case STATUS_FILTER_HASH:
+		if (version <= IPA_VERSION_2_6L)
+			return 0;	/* Not present on IPA v2.x */
 		return le32_get_bits(word[3], GENMASK(1, 1));
 	case STATUS_FILTER_GLOBAL:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[3], GENMASK(1, 1));
 		return le32_get_bits(word[3], GENMASK(2, 2));
 	case STATUS_FILTER_RETAIN:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[3], GENMASK(7, 7));
 		return le32_get_bits(word[3], GENMASK(3, 3));
 	case STATUS_FILTER_RULE_INDEX:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[3], GENMASK(15, 8));
 		return le32_get_bits(word[3], GENMASK(13, 4));
 	/* ROUTER_TABLE is in word 3, bits 14-21 (IPA v5.0+) */
 	case STATUS_ROUTER_LOCAL:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(16, 16));
 		if (version < IPA_VERSION_5_0)
 			return le32_get_bits(word[3], GENMASK(14, 14));
 		return le32_get_bits(word[1], GENMASK(27, 27));
 	case STATUS_ROUTER_HASH:
+		if (version <= IPA_VERSION_2_6L)
+			return 0;	/* Not present on IPA v2.x */
 		if (version < IPA_VERSION_5_0)
 			return le32_get_bits(word[3], GENMASK(15, 15));
 		return le32_get_bits(word[1], GENMASK(28, 28));
 	case STATUS_UCP:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(23, 23));
 		if (version < IPA_VERSION_5_0)
 			return le32_get_bits(word[3], GENMASK(16, 16));
 		return le32_get_bits(word[7], GENMASK(31, 31));
 	case STATUS_ROUTER_TABLE:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(21, 17));
 		if (version < IPA_VERSION_5_0)
 			return le32_get_bits(word[3], GENMASK(21, 17));
 		return le32_get_bits(word[3], GENMASK(21, 14));
 	case STATUS_ROUTER_RULE_INDEX:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(31, 24));
 		return le32_get_bits(word[3], GENMASK(31, 22));
 	case STATUS_NAT_HIT:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(0, 0));
 		return le32_get_bits(word[4], GENMASK(0, 0));
 	case STATUS_NAT_INDEX:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(13, 1));
 		return le32_get_bits(word[4], GENMASK(13, 1));
 	case STATUS_NAT_TYPE:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(15, 14));
 		return le32_get_bits(word[4], GENMASK(15, 14));
 	case STATUS_TAG_LOW32:
 		return le32_get_bits(word[4], GENMASK(31, 16)) |
@@ -197,8 +221,12 @@ static u32 ipa_status_extract(struct ipa *ipa, const void *data,
 	case STATUS_TAG_HIGH16:
 		return le32_get_bits(word[5], GENMASK(31, 16));
 	case STATUS_SEQUENCE:
+		if (version <= IPA_VERSION_2_6L)
+			return 0;	/* Not present on IPA v2.x */
 		return le32_get_bits(word[6], GENMASK(7, 0));
 	case STATUS_TIME_OF_DAY:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_to_cpu(word[5]);
 		return le32_get_bits(word[6], GENMASK(31, 8));
 	case STATUS_HEADER_LOCAL:
 		return le32_get_bits(word[7], GENMASK(0, 0));
@@ -1465,8 +1493,21 @@ static bool ipa_endpoint_skb_build(struct ipa_endpoint *endpoint,
  /* The format of an IPA packet status structure is the same for several
   * status types (opcodes).  Other types aren't currently supported.
  */
-static bool ipa_status_format_packet(enum ipa_status_opcode opcode)
+static bool ipa_status_format_packet(struct ipa *ipa, u32 opcode)
 {
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		/* IPA v2.x uses enum values, not the v3+ bitmask values. */
+		switch (opcode) {
+		case 0:	/* packet */
+		case 2:	/* dropped */
+		case 3:	/* suspended */
+		case 6:	/* packet, second pass */
+			return true;
+		default:
+			return false;
+		}
+	}
+
 	switch (opcode) {
 	case IPA_STATUS_OPCODE_PACKET:
 	case IPA_STATUS_OPCODE_DROPPED_PACKET:
@@ -1486,7 +1527,7 @@ ipa_endpoint_status_skip(struct ipa_endpoint *endpoint, const void *data)
 	u32 endpoint_id;
 
 	opcode = ipa_status_extract(ipa, data, STATUS_OPCODE);
-	if (!ipa_status_format_packet(opcode))
+	if (!ipa_status_format_packet(ipa, opcode))
 		return true;
 
 	endpoint_id = ipa_status_extract(ipa, data, STATUS_DST_ENDPOINT);
@@ -1573,9 +1614,13 @@ ipa_endpoint_status_drop(struct ipa_endpoint *endpoint, const void *data)
 		return exception == IPA_STATUS_EXCEPTION_DEAGGR;
 
 	/* Drop the packet if it fails to match a routing rule; otherwise no */
+	/* IPA v2.x uses an 8-bit rule field and reports a miss as 0xff */
 	rule = ipa_status_extract(ipa, data, STATUS_ROUTER_RULE_INDEX);
+	if (rule == (ipa->version <= IPA_VERSION_2_6L ? 0xff :
+		     IPA_STATUS_RULE_MISS))
+		return true;
 
-	return rule == IPA_STATUS_RULE_MISS;
+	return false;
 }
 
 static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
@@ -1619,6 +1664,16 @@ static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
 		if (endpoint->config.checksum)
 			len += sizeof(struct rmnet_map_dl_csum_trailer);
 
+		if (ipa->version <= IPA_VERSION_2_6L &&
+		    (len > resid || length > buffer_size)) {
+			u32 word0 = le32_to_cpu(*(__le32 *)data);
+
+			dev_err_ratelimited(dev,
+					    "invalid RX status length %u (resid %u, word0 0x%08x)\n",
+					    length, resid, word0);
+			break;
+		}
+
 		if (!ipa_endpoint_status_drop(endpoint, data)) {
 			void *data2;
 			u32 extra;
@@ -1638,6 +1693,11 @@ static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
 		/* Consume status and the full packet it describes */
 		data += len;
 		resid -= len;
+
+		/* A trailing status-sized block is padding, not a packet. */
+		if (ipa->version <= IPA_VERSION_2_6L &&
+		    resid <= IPA_STATUS_SIZE)
+			break;
 	}
 }
 
